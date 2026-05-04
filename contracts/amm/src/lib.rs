@@ -458,14 +458,9 @@ impl AmmPool {
         let total_shares: i128 = Self::get_total_shares(env.clone());
 
         // Compute shares to mint.
-        let mut initial_mint = 0;
         let shares = if total_shares == 0 {
             // Initial liquidity: geometric mean of deposits.
-            let initial_shares = Self::sqrt(amount_a * amount_b);
-            let min_liquidity = 1000;
-            assert!(initial_shares > min_liquidity, "initial liquidity too low");
-            initial_mint = min_liquidity;
-            initial_shares - min_liquidity
+            Self::sqrt(amount_a * amount_b)
         } else {
             // Proportional shares — use the lesser of the two ratios.
             let shares_a = amount_a * total_shares / reserve_a;
@@ -495,16 +490,12 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::ReserveB, &(reserve_b + amount_b));
-        env.storage().instance().set(
-            &DataKey::TotalShares,
-            &(total_shares + shares + initial_mint),
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &(total_shares + shares));
 
         // Mint LP tokens.
         let lp_client = LpTokenClient::new(&env, &lp_token);
-        if initial_mint > 0 {
-            lp_client.mint(&env.current_contract_address(), &initial_mint);
-        }
         lp_client.mint(&provider, &shares);
 
         env.events().publish(
@@ -2812,11 +2803,7 @@ mod prop_tests {
     use super::tests::*;
     use super::*;
     use proptest::prelude::*;
-    use soroban_sdk::token::{StellarAssetClient, TokenClient as StellarTokenClient};
-    use soroban_sdk::{
-        testutils::{Address as _, Ledger as _},
-        Address, Bytes, Env, String, Vec,
-    };
+    use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
 
     proptest! {
         /// Property 1: For any valid first deposit, initial shares (sqrt(a*b)) are always positive.
@@ -2980,7 +2967,6 @@ mod prop_tests {
     #[should_panic]
     fn test_pause_requires_admin_auth() {
         let env = Env::default();
-        let admin = Address::generate(&env);
         let amm_addr = env.register_contract(None, AmmPool);
         let amm = AmmPoolClient::new(&env, &amm_addr);
 
@@ -2991,7 +2977,6 @@ mod prop_tests {
     #[should_panic]
     fn test_unpause_requires_admin_auth() {
         let env = Env::default();
-        let admin = Address::generate(&env);
         let amm_addr = env.register_contract(None, AmmPool);
         let amm = AmmPoolClient::new(&env, &amm_addr);
 

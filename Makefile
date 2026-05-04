@@ -4,9 +4,9 @@
 all: build
 
 build:
-	cargo build --release --target wasm32-unknown-unknown
+	cargo build --release --target wasm32v1-none
 
-test:
+test: build
 	cargo test
 
 fmt:

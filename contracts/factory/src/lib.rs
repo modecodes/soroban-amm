@@ -315,7 +315,7 @@ impl Factory {
 //
 // Tests deploy the AMM and token contracts as real WASM. Build the WASM first:
 //
-//   cargo build --release --target wasm32-unknown-unknown
+//   cargo build --release --target wasm32v1-none
 //
 // Then run:
 //
@@ -328,16 +328,17 @@ mod tests {
 
     // Embed compiled WASM at test-compile time.
     mod amm_wasm {
-        soroban_sdk::contractimport!(file = "../../target/wasm32-unknown-unknown/release/amm.wasm");
+        soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/amm.wasm");
     }
 
     mod token_wasm {
-        soroban_sdk::contractimport!(file = "../../target/wasm32-unknown-unknown/release/token.wasm");
+        soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/token.wasm");
     }
 
     #[test]
     fn test_create_pool() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
@@ -360,6 +361,7 @@ mod tests {
     #[test]
     fn test_normalize_order() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
@@ -382,6 +384,7 @@ mod tests {
     #[test]
     fn test_duplicate_pool_panics() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
@@ -403,6 +406,7 @@ mod tests {
     #[test]
     fn test_all_pools() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
@@ -431,6 +435,7 @@ mod tests {
     #[test]
     fn test_lp_token_default_names_are_distinct() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
@@ -463,6 +468,7 @@ mod tests {
     #[test]
     fn test_lp_token_custom_name_and_symbol() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
@@ -499,6 +505,7 @@ mod tests {
     #[test]
     fn test_update_wasm_hashes_non_admin_panics() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
@@ -519,6 +526,7 @@ mod tests {
     #[test]
     fn test_update_wasm_hashes_updates_storage_and_allows_new_pool() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
