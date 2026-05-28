@@ -82,7 +82,6 @@ pub enum DataKey {
     ClPool(Address, Address, i128),  // normalized (token_a, token_b, fee_bps) → CL pool Address
 }
 
-
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -222,7 +221,12 @@ impl Factory {
 
         // Initialize AMM pool.
         AmmPoolClient::new(&env, &pool_addr).initialize(
-            &pool_admin, &ta, &tb, &lp_addr, &fee_bps, &admin,  // fee_recipient
+            &pool_admin,
+            &ta,
+            &tb,
+            &lp_addr,
+            &fee_bps,
+            &admin,  // fee_recipient
             &0_i128, // protocol_fee_bps (disabled by default)
         );
 
@@ -385,7 +389,6 @@ impl Factory {
             .get(&DataKey::GovernanceFor(pool))
             .unwrap_or(None)
     }
-
 
     /// Return the pool address for `(token_a, token_b)`, or `None` if it does
     /// not exist. Token pair order does not matter.

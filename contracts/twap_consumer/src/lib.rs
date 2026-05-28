@@ -44,9 +44,11 @@ impl TwapConsumer {
         };
         let key = DataKey::Snapshot(pool, ledger_ts);
         env.storage().persistent().set(&key, &snapshot);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, Self::SNAPSHOT_TTL_LEDGERS / 2, Self::SNAPSHOT_TTL_LEDGERS);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::SNAPSHOT_TTL_LEDGERS / 2,
+            Self::SNAPSHOT_TTL_LEDGERS,
+        );
     }
 
     /// Deletes a price snapshot from persistent storage.
@@ -243,7 +245,14 @@ mod tests {
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_000_i128);
-        amm.swap(&whale, &ta.address, &1_000_000_i128, &0_i128, &10_060_u64, &None);
+        amm.swap(
+            &whale,
+            &ta.address,
+            &1_000_000_i128,
+            &0_i128,
+            &10_060_u64,
+            &None,
+        );
 
         let twap = consumer.get_twap_price(&amm_addr, &60_u64);
         let (spot_a, _spot_b) = amm.price_ratio();
@@ -303,7 +312,14 @@ mod tests {
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_i128);
-        amm.swap(&whale, &ta.address, &1_000_i128, &0_i128, &10_060_u64, &None);
+        amm.swap(
+            &whale,
+            &ta.address,
+            &1_000_i128,
+            &0_i128,
+            &10_060_u64,
+            &None,
+        );
 
         let (twap_a_to_b, twap_b_to_a) = consumer.get_twap_both(&amm_addr, &60_u64);
 
@@ -362,7 +378,14 @@ mod tests {
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_i128);
-        amm.swap(&whale, &ta.address, &1_000_i128, &0_i128, &10_060_u64, &None);
+        amm.swap(
+            &whale,
+            &ta.address,
+            &1_000_i128,
+            &0_i128,
+            &10_060_u64,
+            &None,
+        );
 
         let (twap_a_to_b, twap_b_to_a) = consumer.get_twap_both(&amm_addr, &60_u64);
 
@@ -421,7 +444,14 @@ mod tests {
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_i128);
-        amm.swap(&whale, &ta.address, &1_000_i128, &0_i128, &10_060_u64, &None);
+        amm.swap(
+            &whale,
+            &ta.address,
+            &1_000_i128,
+            &0_i128,
+            &10_060_u64,
+            &None,
+        );
         let price = consumer.get_twap_price(&amm_addr, &60_u64);
         assert_eq!(price, 1_000_000);
 
