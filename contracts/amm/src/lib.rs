@@ -2859,6 +2859,97 @@ pub(crate) mod tests {
         // 4e18 * 1e17 * 10000 = 4e39 > i128::MAX
         amm.get_amount_in(&ts.ta_addr, &100_000_000_000_000_000_i128);
     }
+
+    // Issue #199: remove_liquidity_one_sided — provider receives only token_a.
+    #[test]
+    fn test_remove_liquidity_one_sided() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+        let ta_client = StellarTokenClient::new(env, &ts.ta_addr);
+        let tb_client = StellarTokenClient::new(env, &ts.tb_addr);
+
+        // LP1 seeds the pool so LP2's internal swap has residual reserves to trade against.
+        let lp1 = Address::generate(env);
+        ta_sac.mint(&lp1, &2_000_000_i128);
+        tb_sac.mint(&lp1, &2_000_000_i128);
+        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &u64::MAX);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        let shares = amm.add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        let ta_before = ta_client.balance(&provider);
+        let tb_before = tb_client.balance(&provider);
+
+        // Remove one-sided: provider wants only token_a.
+        // min_out = 1_000_000 ensures at least the proportional withdrawal.
+        let total_out = amm.remove_liquidity_one_sided(
+            &provider,
+            &shares,
+            &ts.ta_addr,
+            &1_000_000_i128,
+            &u64::MAX,
+        );
+
+        let ta_after = ta_client.balance(&provider);
+        let tb_after = tb_client.balance(&provider);
+
+        // Provider received exactly total_out of token_a.
+        assert_eq!(ta_after - ta_before, total_out);
+        // Provider's token_b balance is unchanged — received no token_b.
+        assert_eq!(tb_after, tb_before);
+        // Total received is more than the proportional token_a alone because the
+        // unwanted token_b was swapped internally for more token_a.
+        assert!(total_out > 1_000_000);
+        // LP shares are fully redeemed.
+        assert_eq!(amm.shares_of(&provider), 0);
+    }
+
+    // Issue #199: min_out slippage guard is enforced in remove_liquidity_one_sided.
+    #[test]
+    fn test_remove_liquidity_one_sided_slippage_fails() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let lp1 = Address::generate(env);
+        ta_sac.mint(&lp1, &2_000_000_i128);
+        tb_sac.mint(&lp1, &2_000_000_i128);
+        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &u64::MAX);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        let shares = amm.add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        // min_out set impossibly high — must fail.
+        let result = amm.try_remove_liquidity_one_sided(
+            &provider,
+            &shares,
+            &ts.ta_addr,
+            &i128::MAX,
+            &u64::MAX,
+        );
+        assert!(result.is_err());
+    }
 }
 
 // ── Property-based tests ───────────────────────────────────────────────────────

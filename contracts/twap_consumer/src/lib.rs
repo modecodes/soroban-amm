@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractclient, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contractclient, contractimpl, contracttype, Address, Env, Vec};
 
 #[contractclient(name = "AmmPoolOracleClient")]
 pub trait AmmPoolOracle {
@@ -15,6 +15,7 @@ pub trait ClPoolOracle {
 #[contracttype]
 pub enum DataKey {
     Snapshot(Address, u64),
+    TrackedPools,
 }
 
 #[contracttype]
@@ -34,6 +35,9 @@ impl TwapConsumer {
     pub const SNAPSHOT_TTL_LEDGERS: u32 = 120_960;
 
     /// Stores a pool cumulative-price snapshot keyed by the pool timestamp.
+    ///
+    /// Also registers the pool in the TrackedPools list if it has not been seen before,
+    /// enabling `get_tracked_pools` and `get_twap_all` to enumerate all observed pools.
     pub fn save_snapshot(env: Env, pool: Address) {
         let (cum_a, cum_b, pool_ts) = AmmPoolOracleClient::new(&env, &pool).get_price_cumulative();
         let ledger_ts = env.ledger().timestamp(); // key by keeper clock, not pool clock
@@ -42,13 +46,33 @@ impl TwapConsumer {
             cum_b,
             pool_ts,
         };
-        let key = DataKey::Snapshot(pool, ledger_ts);
+        let key = DataKey::Snapshot(pool.clone(), ledger_ts);
         env.storage().persistent().set(&key, &snapshot);
         env.storage().persistent().extend_ttl(
             &key,
             Self::SNAPSHOT_TTL_LEDGERS / 2,
             Self::SNAPSHOT_TTL_LEDGERS,
         );
+
+        // Register pool if not already tracked.
+        let mut tracked: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::TrackedPools)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut already_tracked = false;
+        for i in 0..tracked.len() {
+            if tracked.get(i).unwrap() == pool {
+                already_tracked = true;
+                break;
+            }
+        }
+        if !already_tracked {
+            tracked.push_back(pool);
+            env.storage()
+                .instance()
+                .set(&DataKey::TrackedPools, &tracked);
+        }
     }
 
     /// Deletes a price snapshot from persistent storage.
@@ -122,6 +146,33 @@ impl TwapConsumer {
         let twap_b_to_a = delta_b / elapsed;
 
         (twap_a_to_b, twap_b_to_a)
+    }
+
+    /// Returns the list of pool addresses that have had at least one snapshot saved.
+    pub fn get_tracked_pools(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TrackedPools)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the TWAP for every tracked AMM pool in one call.
+    ///
+    /// Each element is `(pool_address, twap_price)` where `twap_price` is the
+    /// time-weighted average price of token A denominated in token B, scaled by
+    /// 1_000_000, over `window_seconds`.
+    ///
+    /// A snapshot at `now - window_seconds` must have been saved for every
+    /// tracked pool, otherwise this call panics.
+    pub fn get_twap_all(env: Env, window_seconds: u64) -> Vec<(Address, i128)> {
+        let tracked: Vec<Address> = Self::get_tracked_pools(env.clone());
+        let mut results: Vec<(Address, i128)> = Vec::new(&env);
+        for i in 0..tracked.len() {
+            let pool = tracked.get(i).unwrap();
+            let twap = Self::get_twap_price(env.clone(), pool.clone(), window_seconds);
+            results.push_back((pool, twap));
+        }
+        results
     }
 
     /// Computes the time-weighted average tick from a CL pool over `window_seconds`.
@@ -392,6 +443,101 @@ mod tests {
         // With 1:2 reserves, twap_a_to_b should be 2M and twap_b_to_a should be 0.5M
         assert_eq!(twap_a_to_b, 2_000_000);
         assert_eq!(twap_b_to_a, 500_000);
+    }
+
+    // Issue #200: save_snapshot called for two pools — both appear in get_tracked_pools,
+    // and get_twap_all returns correct TWAPs for both.
+    #[test]
+    fn test_get_tracked_pools_and_twap_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let admin = Address::generate(&env);
+
+        // ── Pool 1 setup ──────────────────────────────────────────────────────
+        let amm_addr1 = env.register_contract(None, AmmPool);
+        let lp_addr1 = env.register_contract(None, LpToken);
+        token::LpTokenClient::new(&env, &lp_addr1).initialize(
+            &amm_addr1,
+            &soroban_sdk::String::from_str(&env, "LP1"),
+            &soroban_sdk::String::from_str(&env, "LP1"),
+            &7u32,
+        );
+        let (ta1, ta1_sac) = create_sac(&env, &admin);
+        let (tb1, tb1_sac) = create_sac(&env, &admin);
+        let amm1 = AmmPoolClient::new(&env, &amm_addr1);
+        amm1.initialize(&admin, &ta1.address, &tb1.address, &lp_addr1, &30_i128, &admin, &0_i128);
+        let p1 = Address::generate(&env);
+        ta1_sac.mint(&p1, &2_000_000_i128);
+        tb1_sac.mint(&p1, &2_000_000_i128);
+        amm1.add_liquidity(&p1, &2_000_000_i128, &2_000_000_i128, &0_i128, &10_000_u64);
+
+        // ── Pool 2 setup (2:1 reserve ratio) ─────────────────────────────────
+        let amm_addr2 = env.register_contract(None, AmmPool);
+        let lp_addr2 = env.register_contract(None, LpToken);
+        token::LpTokenClient::new(&env, &lp_addr2).initialize(
+            &amm_addr2,
+            &soroban_sdk::String::from_str(&env, "LP2"),
+            &soroban_sdk::String::from_str(&env, "LP2"),
+            &7u32,
+        );
+        let (ta2, ta2_sac) = create_sac(&env, &admin);
+        let (tb2, tb2_sac) = create_sac(&env, &admin);
+        let amm2 = AmmPoolClient::new(&env, &amm_addr2);
+        amm2.initialize(&admin, &ta2.address, &tb2.address, &lp_addr2, &30_i128, &admin, &0_i128);
+        let p2 = Address::generate(&env);
+        ta2_sac.mint(&p2, &2_000_000_i128);
+        tb2_sac.mint(&p2, &4_000_000_i128);
+        amm2.add_liquidity(&p2, &2_000_000_i128, &4_000_000_i128, &0_i128, &10_000_u64);
+
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+
+        // Save a snapshot for each pool at t=10_000.
+        consumer.save_snapshot(&amm_addr1);
+        consumer.save_snapshot(&amm_addr2);
+
+        // Both pools must appear in get_tracked_pools.
+        let tracked = consumer.get_tracked_pools();
+        assert_eq!(tracked.len(), 2);
+        assert!(tracked.contains(&amm_addr1));
+        assert!(tracked.contains(&amm_addr2));
+
+        // Calling save_snapshot again for pool1 must NOT add a duplicate.
+        consumer.save_snapshot(&amm_addr1);
+        assert_eq!(consumer.get_tracked_pools().len(), 2);
+
+        // Advance time and do small swaps to bump the price accumulators.
+        env.ledger().set_timestamp(10_060);
+        let whale1 = Address::generate(&env);
+        ta1_sac.mint(&whale1, &1_000_i128);
+        amm1.swap(&whale1, &ta1.address, &1_000_i128, &0_i128, &10_060_u64, &None);
+        let whale2 = Address::generate(&env);
+        ta2_sac.mint(&whale2, &1_000_i128);
+        amm2.swap(&whale2, &ta2.address, &1_000_i128, &0_i128, &10_060_u64, &None);
+
+        // get_twap_all must return TWAPs for both pools.
+        let all_twaps = consumer.get_twap_all(&60_u64);
+        assert_eq!(all_twaps.len(), 2);
+
+        // Pool 1 (1:1 reserves) → TWAP ≈ 1_000_000.
+        let twap1 = consumer.get_twap_price(&amm_addr1, &60_u64);
+        assert_eq!(twap1, 1_000_000);
+
+        // Pool 2 (1:2 reserves) → TWAP ≈ 2_000_000.
+        let twap2 = consumer.get_twap_price(&amm_addr2, &60_u64);
+        assert_eq!(twap2, 2_000_000);
+
+        // Verify get_twap_all returns correct values for each pool.
+        for i in 0..all_twaps.len() {
+            let (pool, twap) = all_twaps.get(i).unwrap();
+            if pool == amm_addr1 {
+                assert_eq!(twap, twap1);
+            } else {
+                assert_eq!(twap, twap2);
+            }
+        }
     }
 
     #[test]
