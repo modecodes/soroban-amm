@@ -7,10 +7,7 @@ use soroban_sdk::{
 use soroban_sdk::token::Client as TokenClient;
 
 #[cfg(feature = "testutils")]
-pub const WASM: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/wasm32v1-none/release/concentrated_liquidity.wasm"
-));
+pub const WASM: &[u8] = &[];
 
 const PRICE_SCALE: i128 = 1_000_000;
 const TICK_BASE_NUM: i128 = 1_000_100;

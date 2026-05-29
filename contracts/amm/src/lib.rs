@@ -107,6 +107,18 @@ pub trait FlashLoanReceiver {
     fn on_flash_loan(env: Env, token: Address, amount: i128, fee: i128, data: Bytes) -> bool;
 }
 
+#[contractclient(name = "FlashLoanBothReceiverClient")]
+pub trait FlashLoanBothReceiver {
+    fn on_flash_loan_both(
+        env: Env,
+        amount_a: i128,
+        fee_a: i128,
+        amount_b: i128,
+        fee_b: i128,
+        data: Bytes,
+    ) -> bool;
+}
+
 // ── Swap simulation returned by `simulate_swap` ───────────────────────────────
 
 #[contracttype]
