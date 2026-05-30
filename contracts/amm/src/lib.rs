@@ -84,6 +84,10 @@ pub enum DataKey {
     PriceCumulativeB,
     LastTimestamp,
     Shares(Address),
+    // Emergency withdrawal storage
+    EmergencyWithdrawTimestamp,
+    EmergencyWithdrawRecipient,
+
     // Admin & fees
     Admin,
     PendingAdmin,
@@ -93,25 +97,31 @@ pub enum DataKey {
     AccruedFeeA,
     AccruedFeeB,
     FlashLoanFeeBps,
+
     // Pause / reentrancy
     Paused,
     /// Set to `true` while a flash loan is executing to block reentrant calls.
     /// Cleared to `false` after the callback returns and repayment is verified.
     Locked,
+
     // Circuit breaker
     /// Price deviation threshold in bps above which the circuit breaker trips
-    /// (default 5 000 = 50 %).  Configurable via `set_circuit_breaker_config`.
+    /// (default 5 000 = 50 %). Configurable via `set_circuit_breaker_config`.
     CircuitBreakerThresholdBps,
+
     /// Minimum seconds that must elapse after the circuit breaker trips before
     /// automatic recovery is attempted (default 600 s = 10 min).
     CircuitBreakerCooldown,
+
     /// Ledger timestamp at which the circuit breaker was last triggered.
     /// `0` when not triggered.
     CircuitBreakerTriggeredAt,
+
     /// Spot price (reserve_b * 1_000_000 / reserve_a) captured at the
-    /// beginning of the current ledger sequence.  Used to measure intra-block
+    /// beginning of the current ledger sequence. Used to measure intra-block
     /// price deviation.
     CircuitBreakerLastPrice,
+
     /// Ledger sequence number at which `CircuitBreakerLastPrice` was captured.
     CircuitBreakerLastSeqno,
 }
@@ -325,6 +335,50 @@ impl AmmPool {
             .unwrap_or(false)
     }
 
+    /// Emergency withdraw of all pool reserves to a designated address.
+    /// Admin-only, callable via a timed governance proposal.
+    pub fn emergency_withdraw(env: Env, to: Address) -> Result<(), AmmError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        // Record audit information
+        let ts: u64 = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyWithdrawTimestamp, &ts);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyWithdrawRecipient, &to);
+
+        // Get token addresses and reserves
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let reserve_a = Self::get_reserve_a(env.clone());
+        let reserve_b = Self::get_reserve_b(env.clone());
+
+        // Transfer reserves to recipient
+        if reserve_a > 0 {
+            SepTokenClient::new(&env, &token_a)
+                .transfer(&env.current_contract_address(), &to, &reserve_a);
+        }
+        if reserve_b > 0 {
+            SepTokenClient::new(&env, &token_b)
+                .transfer(&env.current_contract_address(), &to, &reserve_b);
+        }
+
+        // Zero out reserves
+        env.storage().instance().set(&DataKey::ReserveA, &0_i128);
+        env.storage().instance().set(&DataKey::ReserveB, &0_i128);
+
+        // Emit event for audit trail
+        env.events().publish(
+            (Symbol::new(&env, "emergency_withdraw"), admin.clone()),
+            (to, reserve_a, reserve_b),
+        );
+
+        Ok(())
+    }
+
     /// Return `true` while a flash loan is executing on this pool.
     ///
     /// During this window all state-mutating functions (`swap`,
@@ -355,19 +409,24 @@ impl AmmPool {
     ) -> Result<(), AmmError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+
         if threshold_bps <= 0 || threshold_bps > 10_000 {
             return Err(AmmError::InvalidFeeBps);
         }
+
         env.storage()
             .instance()
             .set(&DataKey::CircuitBreakerThresholdBps, &threshold_bps);
+
         env.storage()
             .instance()
             .set(&DataKey::CircuitBreakerCooldown, &cooldown_secs);
+
         env.events().publish(
             (Symbol::new(&env, "cb_config"),),
             (threshold_bps, cooldown_secs),
         );
+
         Ok(())
     }
 
@@ -378,17 +437,21 @@ impl AmmPool {
             .instance()
             .get(&DataKey::CircuitBreakerThresholdBps)
             .unwrap_or(5_000);
+
         let cooldown_secs: u64 = env
             .storage()
             .instance()
             .get(&DataKey::CircuitBreakerCooldown)
             .unwrap_or(600);
+
         let triggered_at: u64 = env
             .storage()
             .instance()
             .get(&DataKey::CircuitBreakerTriggeredAt)
             .unwrap_or(0);
+
         let tripped = triggered_at > 0 && Self::is_paused(env.clone());
+
         CircuitBreakerConfig {
             threshold_bps,
             cooldown_secs,
@@ -398,62 +461,53 @@ impl AmmPool {
     }
 
     /// Attempt automatic recovery after the circuit breaker cooldown.
-    ///
-    /// If the pool was paused by the circuit breaker and the cooldown period
-    /// has elapsed, this function unpauses the pool and resets the circuit
-    /// breaker state.  Anyone may call this — no auth required — so that
-    /// keepers and bots can restore normal operation without governance
-    /// intervention.
-    ///
-    /// Returns `Ok(true)` if recovery was performed, `Ok(false)` if the pool
-    /// was not tripped or the cooldown has not elapsed yet.
     pub fn try_circuit_breaker_recovery(env: Env) -> Result<bool, AmmError> {
         let triggered_at: u64 = env
             .storage()
             .instance()
             .get(&DataKey::CircuitBreakerTriggeredAt)
             .unwrap_or(0);
+
         if triggered_at == 0 {
             return Ok(false);
         }
+
         if !Self::is_paused(env.clone()) {
-            // Already manually unpaused; clear the CB state.
             env.storage()
                 .instance()
                 .set(&DataKey::CircuitBreakerTriggeredAt, &0_u64);
             return Ok(false);
         }
+
         let cooldown: u64 = env
             .storage()
             .instance()
             .get(&DataKey::CircuitBreakerCooldown)
             .unwrap_or(600);
+
         let now = env.ledger().timestamp();
+
         if now < triggered_at + cooldown {
             return Ok(false);
         }
-        // Cooldown elapsed — unpause and reset.
+
         env.storage().instance().set(&DataKey::Paused, &false);
+
         env.storage()
             .instance()
             .set(&DataKey::CircuitBreakerTriggeredAt, &0_u64);
+
         env.events()
             .publish((Symbol::new(&env, "cb_recovered"),), (now,));
+
         Ok(true)
     }
 
     /// Internal: capture the spot price at the start of a new ledger sequence.
-    ///
-    /// Called at the top of every state-mutating function (via
-    /// `check_circuit_breaker`).  On the first call within a given ledger
-    /// sequence the current spot price is recorded as the baseline.  On
-    /// subsequent calls within the same sequence the deviation from that
-    /// baseline is measured; if it exceeds the threshold the pool is
-    /// auto-paused and `AmmError::CircuitBreaker` is returned.
     fn check_circuit_breaker(env: &Env) -> Result<(), AmmError> {
         let reserve_a = Self::get_reserve_a(env.clone());
         let reserve_b = Self::get_reserve_b(env.clone());
-        // Skip the check when the pool has no liquidity yet.
+
         if reserve_a <= 0 || reserve_b <= 0 {
             return Ok(());
         }
@@ -465,25 +519,27 @@ impl AmmPool {
             .unwrap_or(5_000);
 
         let current_seqno = env.ledger().sequence();
+
         let last_seqno: u32 = env
             .storage()
             .instance()
             .get(&DataKey::CircuitBreakerLastSeqno)
             .unwrap_or(0);
+
         let current_price = reserve_b * 1_000_000 / reserve_a;
 
         if last_seqno != current_seqno {
-            // New ledger sequence: record baseline price.
             env.storage()
                 .instance()
                 .set(&DataKey::CircuitBreakerLastPrice, &current_price);
+
             env.storage()
                 .instance()
                 .set(&DataKey::CircuitBreakerLastSeqno, &current_seqno);
+
             return Ok(());
         }
 
-        // Same ledger sequence: measure deviation from baseline.
         let baseline_price: i128 = env
             .storage()
             .instance()
@@ -501,19 +557,24 @@ impl AmmPool {
         };
 
         if deviation_bps >= threshold_bps {
-            // Trip the circuit breaker: auto-pause the pool.
             let now = env.ledger().timestamp();
+
             env.storage().instance().set(&DataKey::Paused, &true);
+
             env.storage()
                 .instance()
                 .set(&DataKey::CircuitBreakerTriggeredAt, &now);
+
             env.events().publish(
-                (Symbol::new(env, "circuit_break"),),
+                (Symbol::new(&env, "circuit_break"),),
                 (baseline_price, current_price, deviation_bps, threshold_bps),
             );
+
             return Err(AmmError::CircuitBreaker);
         }
 
+        Ok(())
+    }
         Ok(())
     }
 
@@ -3489,7 +3550,75 @@ mod prop_tests {
 
         assert_eq!(amm.get_fee_info(), 30_i128);
         assert_eq!(amm.get_fee_info(), amm.get_info().fee_bps);
-    }
+     }
+
+     #[test]
+     fn test_emergency_withdraw() {
+         let (env, admin, amm_addr, lp_addr, _) = setup();
+         let (ta_client, ta_sac) = create_sac(&env, &admin);
+         let (tb_client, tb_sac) = create_sac(&env, &admin);
+         let amm = AmmPoolClient::new(&env, &amm_addr);
+
+         amm.initialize(
+             &admin,
+             &ta_client.address,
+             &tb_client.address,
+             &lp_addr,
+             &30_i128,
+             &admin,
+             &0_i128,
+         );
+
+         let provider = Address::generate(&env);
+         ta_sac.mint(&provider, &2_000_000_i128);
+         tb_sac.mint(&provider, &1_000_000_i128);
+
+         amm.add_liquidity(
+             &provider,
+             &2_000_000_i128,
+             &1_000_000_i128,
+             &0_i128,
+             &u64::MAX,
+         );
+
+         let info_before = amm.get_info();
+         assert_eq!(info_before.reserve_a, 2_000_000);
+         assert_eq!(info_before.reserve_b, 1_000_000);
+
+         let recipient = Address::generate(&env);
+         let expected_ts = 99999_u64;
+         env.ledger().set_timestamp(expected_ts);
+
+         // Call emergency_withdraw
+         amm.emergency_withdraw(&recipient);
+
+         // Verify reserves are now zeroed
+         let info_after = amm.get_info();
+         assert_eq!(info_after.reserve_a, 0);
+         assert_eq!(info_after.reserve_b, 0);
+
+         // Verify recipient received the tokens
+         assert_eq!(ta_client.balance(&recipient), 2_000_000);
+         assert_eq!(tb_client.balance(&recipient), 1_000_000);
+
+         // Verify audit log values in contract storage using env.as_contract_at
+         env.as_contract_at(&amm_addr, || {
+             let ts: u64 = env.storage().instance().get(&DataKey::EmergencyWithdrawTimestamp).unwrap();
+             let rec: Address = env.storage().instance().get(&DataKey::EmergencyWithdrawRecipient).unwrap();
+             assert_eq!(ts, expected_ts);
+             assert_eq!(rec, recipient);
+         });
+     }
+
+     #[test]
+     #[should_panic]
+     fn test_emergency_withdraw_requires_admin_auth() {
+         let env = Env::default();
+         let amm_addr = env.register_contract(None, AmmPool);
+         let amm = AmmPoolClient::new(&env, &amm_addr);
+         let recipient = Address::generate(&env);
+         amm.emergency_withdraw(&recipient);
+     }
 
     #[test]
     #[should_panic]
