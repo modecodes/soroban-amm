@@ -2,7 +2,7 @@ import { ApolloServer } from "@apollo/server";
 import { startStandaloneServer } from "@apollo/server/standalone";
 import { PubSub } from "graphql-subscriptions";
 import { typeDefs } from "./schema.js";
-import { defaultIndexer } from "./indexer.js";
+import { defaultIndexer, type AlertConfig } from "./indexer.js";
 
 const pubsub = new PubSub();
 
@@ -20,7 +20,26 @@ const resolvers = {
       _: unknown,
       { poolId, from, to }: { poolId: string; from?: number; to?: number },
     ) => defaultIndexer.getPriceHistory(poolId, from, to),
-    twal: () => null, // populated by indexer integration with twal_consumer contract
+    twal: () => null,
+    poolHealth: (_: unknown, { poolId }: { poolId: string }) =>
+      defaultIndexer.getPoolHealth(poolId),
+    alertConfigs: (_: unknown, { poolId }: { poolId?: string }) =>
+      defaultIndexer.getAlertConfigs(poolId),
+  },
+  Mutation: {
+    setAlertConfig: (
+      _: unknown,
+      {
+        poolId,
+        metric,
+        thresholdBps,
+      }: { poolId: string; metric: string; thresholdBps: number },
+    ): AlertConfig =>
+      defaultIndexer.setAlertConfig({ poolId, metric, thresholdBps }),
+    removeAlertConfig: (
+      _: unknown,
+      { poolId, metric }: { poolId: string; metric: string },
+    ): boolean => defaultIndexer.removeAlertConfig(poolId, metric),
   },
   PoolEvent: {
     payload: (parent: { payload: Record<string, unknown> }) =>

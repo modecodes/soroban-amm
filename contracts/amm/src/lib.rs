@@ -68,6 +68,10 @@ pub enum AmmError {
     /// elapse and a call to `try_circuit_breaker_recovery`, or a direct
     /// admin/governance `unpause`.
     CircuitBreaker       = 15,
+    /// A fee-on-transfer token deducted more fees than the caller's
+    /// `min_received` threshold permitted. The pool received fewer tokens
+    /// than requested; the call is reverted to protect the caller.
+    FotSlippage          = 16,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -1928,6 +1932,267 @@ impl AmmPool {
     pub fn shares_of(env: Env, provider: Address) -> i128 {
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
         LpTokenClient::new(&env, &lp_token).balance(&provider)
+    }
+
+    // ── Fee-on-transfer support ───────────────────────────────────────────────
+
+    /// Swap with fee-on-transfer (FOT) token support.
+    ///
+    /// Identical to [`swap`] but measures the actual amount of `token_in`
+    /// received by the pool via a pre/post balance snapshot instead of trusting
+    /// `amount_in`. This handles tokens that silently deduct a transfer fee, so
+    /// the constant-product calculation always uses the true net amount.
+    ///
+    /// # Parameters
+    /// - `min_received` – Minimum tokens the pool must actually receive after any
+    ///   FOT deduction (slippage guard on input). Set to `0` to disable.
+    ///
+    /// # Returns
+    /// `(amount_out, actual_received)` — the output amount transferred to `trader`
+    /// and the net input the pool received.
+    ///
+    /// # Events
+    /// Emits a `fot_detected` event when `actual_received < amount_in`, carrying
+    /// `(nominal_amount_in, actual_received)` for off-chain monitoring.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swap_fot(
+        env: Env,
+        trader: Address,
+        token_in: Address,
+        amount_in: i128,
+        min_out: i128,
+        min_received: i128,
+        deadline: u64,
+        referrer: Option<Address>,
+    ) -> Result<(i128, i128), AmmError> {
+        if deadline < env.ledger().timestamp() {
+            return Err(AmmError::DeadlineExceeded);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
+        }
+        trader.require_auth();
+        if amount_in <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
+
+        Self::checkpoint_oracles(&env);
+        Self::check_circuit_breaker(&env)?;
+
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+
+        let (reserve_in, reserve_out, token_out) = if token_in == token_a {
+            (
+                Self::get_reserve_a(env.clone()),
+                Self::get_reserve_b(env.clone()),
+                token_b.clone(),
+            )
+        } else if token_in == token_b {
+            (
+                Self::get_reserve_b(env.clone()),
+                Self::get_reserve_a(env.clone()),
+                token_a.clone(),
+            )
+        } else {
+            return Err(AmmError::InvalidToken);
+        };
+
+        if reserve_in <= 0 || reserve_out <= 0 {
+            return Err(AmmError::EmptyPool);
+        }
+
+        let pool = env.current_contract_address();
+        let client_in = SepTokenClient::new(&env, &token_in);
+        let balance_before = client_in.balance(&pool);
+
+        client_in.transfer(&trader, &pool, &amount_in);
+
+        let actual_received = client_in.balance(&pool) - balance_before;
+        if actual_received <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
+        if actual_received < min_received {
+            return Err(AmmError::FotSlippage);
+        }
+
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let amount_in_with_fee = actual_received * (10_000 - fee_bps);
+        let amount_out =
+            amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee);
+
+        if amount_out < min_out {
+            return Err(AmmError::SlippageExceeded);
+        }
+        if amount_out >= reserve_out {
+            return Err(AmmError::InsufficientLiquidity);
+        }
+
+        SepTokenClient::new(&env, &token_out).transfer(&pool, &trader, &amount_out);
+
+        let protocol_fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
+        let protocol_fee = if protocol_fee_bps > 0 {
+            actual_received * protocol_fee_bps / 10_000
+        } else {
+            0
+        };
+
+        if token_in == token_a {
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveA, &(reserve_in + actual_received - protocol_fee));
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveB, &(reserve_out - amount_out));
+            if protocol_fee > 0 {
+                let accrued: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AccruedFeeA)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AccruedFeeA, &(accrued + protocol_fee));
+            }
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveB, &(reserve_in + actual_received - protocol_fee));
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveA, &(reserve_out - amount_out));
+            if protocol_fee > 0 {
+                let accrued: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AccruedFeeB)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AccruedFeeB, &(accrued + protocol_fee));
+            }
+        }
+
+        if actual_received < amount_in {
+            env.events().publish(
+                (Symbol::new(&env, "fot_detected"), token_in.clone()),
+                (amount_in, actual_received),
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "swap"), trader),
+            (token_in, actual_received, token_out, amount_out, referrer),
+        );
+
+        Ok((amount_out, actual_received))
+    }
+
+    /// Add liquidity with fee-on-transfer (FOT) token support.
+    ///
+    /// Like [`add_liquidity`] but measures the actual token amounts received
+    /// by the pool via pre/post balance snapshots rather than trusting the
+    /// nominal `amount_a`/`amount_b` values. LP shares are minted proportional
+    /// to what the pool actually received.
+    ///
+    /// # Parameters
+    /// - `min_received_a` – Minimum actual `token_a` the pool must receive.
+    /// - `min_received_b` – Minimum actual `token_b` the pool must receive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_liquidity_fot(
+        env: Env,
+        provider: Address,
+        amount_a: i128,
+        amount_b: i128,
+        min_received_a: i128,
+        min_received_b: i128,
+        min_shares: i128,
+        deadline: u64,
+    ) -> Result<i128, AmmError> {
+        if deadline < env.ledger().timestamp() {
+            return Err(AmmError::DeadlineExceeded);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
+        if Self::is_locked(&env) {
+            return Err(AmmError::Reentrant);
+        }
+        provider.require_auth();
+        if amount_a <= 0 || amount_b <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
+
+        Self::checkpoint_oracles(&env);
+
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+
+        let pool = env.current_contract_address();
+        let client_a = SepTokenClient::new(&env, &token_a);
+        let client_b = SepTokenClient::new(&env, &token_b);
+
+        let bal_a_before = client_a.balance(&pool);
+        let bal_b_before = client_b.balance(&pool);
+
+        client_a.transfer(&provider, &pool, &amount_a);
+        client_b.transfer(&provider, &pool, &amount_b);
+
+        let actual_a = client_a.balance(&pool) - bal_a_before;
+        let actual_b = client_b.balance(&pool) - bal_b_before;
+
+        if actual_a <= 0 || actual_b <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
+        if actual_a < min_received_a || actual_b < min_received_b {
+            return Err(AmmError::FotSlippage);
+        }
+
+        let reserve_a: i128 = Self::get_reserve_a(env.clone());
+        let reserve_b: i128 = Self::get_reserve_b(env.clone());
+        let total_shares: i128 = Self::get_total_shares(env.clone());
+
+        let shares = if total_shares == 0 {
+            Self::sqrt(actual_a * actual_b)
+        } else {
+            let shares_a = actual_a * total_shares / reserve_a;
+            let shares_b = actual_b * total_shares / reserve_b;
+            shares_a.min(shares_b)
+        };
+
+        if shares <= 0 {
+            return Err(AmmError::ZeroAmount);
+        }
+        if shares < min_shares {
+            return Err(AmmError::SlippageExceeded);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ReserveA, &(reserve_a + actual_a));
+        env.storage()
+            .instance()
+            .set(&DataKey::ReserveB, &(reserve_b + actual_b));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &(total_shares + shares));
+
+        LpTokenClient::new(&env, &lp_token).mint(&provider, &shares);
+
+        env.events().publish(
+            (Symbol::new(&env, "add_liquidity"), provider),
+            (actual_a, actual_b, shares),
+        );
+
+        Ok(shares)
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
