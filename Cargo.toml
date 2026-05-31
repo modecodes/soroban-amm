@@ -18,6 +18,7 @@ members = [
   "contracts/governance",
   "contracts/staking",
   "contracts/integration-tests",
+  "contracts/oracle_aggregator",
 ]
 
 [workspace.dependencies]

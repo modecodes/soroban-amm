@@ -426,10 +426,7 @@ impl Governance {
             .instance()
             .set(&DataKey::ProposalCount, &(id + 1));
 
-        env.events().publish(
-            (Symbol::new(&env, "proposed"),),
-            (id, proposer, kind, vote_end, snapshot_ledger),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "proposed"),), (id, proposer, kind, vote_end, snapshot_ledger));
 
         Ok(id)
     }
@@ -515,10 +512,7 @@ impl Governance {
         env.storage().persistent().set(&voted_key, &record);
         Self::bump_key_ttl(&env, &voted_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "voted"),),
-            (proposal_id, voter, choice, voting_power),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "voted"),), (proposal_id, voter, choice, voting_power));
         Ok(())
     }
 
@@ -599,10 +593,7 @@ impl Governance {
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_key_ttl(&env, &proposal_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "executed"),),
-            (proposal_id, proposal.kind.clone()),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "executed"),), (proposal_id, proposal.kind.clone()));
         Ok(())
     }
 
@@ -693,10 +684,7 @@ impl Governance {
         LpTokenClient::new(&env, &lp_token).unlock(&voter, &locked);
         env.storage().persistent().remove(&lock_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "vote_unlocked"), voter.clone()),
-            (proposal_id, locked),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "vote_unlocked"), voter.clone()), (proposal_id, locked));
         Ok(())
     }
 
@@ -842,10 +830,7 @@ impl Governance {
         env.storage().persistent().set(&audit_key, &audit);
         Self::bump_key_ttl(&env, &audit_key);
 
-        env.events().publish(
-            (Symbol::new(&env, "vetoed"),),
-            (proposal_id, multisig, now, discussion_end),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "vetoed"),), (proposal_id, multisig, now, discussion_end));
         Ok(())
     }
 
@@ -1407,7 +1392,9 @@ mod tests {
                 e.0 == gov.address && e.1 == (Symbol::new(&s.env, "proposed"),).into_val(&s.env)
             })
             .expect("proposed event not found");
-        let proposed_data: (u32, Address, ProposalKind, u64, u32) = proposed_evt.2.into_val(&s.env);
+        let __ver_7: (u32, (u32, Address, ProposalKind, u64, u32)) = proposed_evt.2.into_val(&s.env);
+        assert_eq!(__ver_7.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let proposed_data: (u32, Address, ProposalKind, u64, u32) = __ver_7.1;
         assert_eq!(
             proposed_data,
             (
@@ -1427,7 +1414,9 @@ mod tests {
             .iter()
             .find(|e| e.0 == gov.address && e.1 == (Symbol::new(&s.env, "voted"),).into_val(&s.env))
             .expect("voted event not found");
-        let voted_data: (u32, Address, Vote, i128) = voted_evt.2.into_val(&s.env);
+        let __ver_8: (u32, (u32, Address, Vote, i128)) = voted_evt.2.into_val(&s.env);
+        assert_eq!(__ver_8.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let voted_data: (u32, Address, Vote, i128) = __ver_8.1;
         assert_eq!(voted_data, (pid, lp1.clone(), Vote::For, 600_i128));
 
         gov.vote(&lp2, &pid, &Vote::For);
@@ -1443,7 +1432,9 @@ mod tests {
                 e.0 == gov.address && e.1 == (Symbol::new(&s.env, "executed"),).into_val(&s.env)
             })
             .expect("executed event not found");
-        let executed_data: (u32, ProposalKind) = executed_evt.2.into_val(&s.env);
+        let __ver_9: (u32, (u32, ProposalKind)) = executed_evt.2.into_val(&s.env);
+        assert_eq!(__ver_9.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let executed_data: (u32, ProposalKind) = __ver_9.1;
         assert_eq!(executed_data, (pid, ProposalKind::UpdateFee(50)));
     }
 
@@ -1723,7 +1714,9 @@ mod tests {
             })
             .expect("vote_unlocked event not emitted");
 
-        let data: (u32, i128) = unlock_evt.2.into_val(&s.env);
+        let __ver_10: (u32, (u32, i128)) = unlock_evt.2.into_val(&s.env);
+        assert_eq!(__ver_10.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (u32, i128) = __ver_10.1;
         assert_eq!(data.0, pid);
         assert_eq!(data.1, 600_i128); // amount_unlocked == voting power used
     }
@@ -1853,7 +1846,9 @@ mod tests {
             .iter()
             .find(|e| e.0 == s.gov_addr && e.1 == (Symbol::new(&s.env, "vetoed"),).into_val(&s.env))
             .expect("vetoed event");
-        let data: (u32, Address, u64, u64) = veto_evt.2.into_val(&s.env);
+        let __ver_11: (u32, (u32, Address, u64, u64)) = veto_evt.2.into_val(&s.env);
+        assert_eq!(__ver_11.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (u32, Address, u64, u64) = __ver_11.1;
         assert_eq!(data.0, pid);
     }
 

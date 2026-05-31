@@ -334,10 +334,7 @@ impl ConcentratedLiquidity {
                 .instance()
                 .set(&DataKey::ActiveLiquidity, &(active + liquidity));
         }
-        env.events().publish(
-            (symbol_short!("mint_pos"), provider),
-            (lower_tick, upper_tick, liquidity, amount_a, amount_b),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("mint_pos"), provider), (lower_tick, upper_tick, liquidity, amount_a, amount_b));
         Ok((amount_a, amount_b))
     }
 
@@ -558,10 +555,7 @@ impl ConcentratedLiquidity {
         // provider, so no transfer is needed — it simply stays in their wallet.
         let dust = amount_in - amount_used;
 
-        env.events().publish(
-            (symbol_short!("mint_1t"), provider),
-            (lower_tick, upper_tick, liquidity, amount_used, dust),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("mint_1t"), provider), (lower_tick, upper_tick, liquidity, amount_used, dust));
 
         Ok(SingleTokenDepositResult {
             amount_used,
@@ -743,10 +737,7 @@ impl ConcentratedLiquidity {
                 &amount_b,
             );
         }
-        env.events().publish(
-            (symbol_short!("burn_pos"), provider),
-            (lower_tick, upper_tick, liquidity, amount_a, amount_b),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("burn_pos"), provider), (lower_tick, upper_tick, liquidity, amount_a, amount_b));
         Ok((amount_a, amount_b))
     }
 
@@ -790,10 +781,7 @@ impl ConcentratedLiquidity {
                 &total_b,
             );
         }
-        env.events().publish(
-            (symbol_short!("coll_fees"), provider),
-            (lower_tick, upper_tick, total_a, total_b),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("coll_fees"), provider), (lower_tick, upper_tick, total_a, total_b));
         Ok((total_a, total_b))
     }
 
@@ -1253,16 +1241,13 @@ impl ConcentratedLiquidity {
             .instance()
             .set(&DataKey::SqrtPriceX96, &sqrt_price_x96);
 
-        env.events().publish(
-            (soroban_sdk::symbol_short!("swap"), sender),
-            (
+        soroban_amm_sdk::emit_versioned_event!(env, (soroban_sdk::symbol_short!("swap"), sender), (
                 zero_for_one,
                 amount_in_actual,
                 amount_out_total,
                 sqrt_price_x96,
                 current_tick,
-            ),
-        );
+            ));
 
         Ok(amount_out_total)
     }
@@ -2353,7 +2338,9 @@ mod tests {
             .iter()
             .find(|e| e.0 == cl_addr && e.1 == expected_topics)
             .expect("coll_fees event must be emitted");
-        let data: (i32, i32, i128, i128) = event.2.into_val(&env);
+        let __ver_4: (u32, (i32, i32, i128, i128)) = event.2.into_val(&env);
+        assert_eq!(__ver_4.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (i32, i32, i128, i128) = __ver_4.1;
         assert_eq!(data, (0_i32, 150_i32, total_a, total_b));
     }
 
@@ -2588,7 +2575,9 @@ mod test {
             .find(|e| e.0 == contract_id && e.1 == expected_topics)
             .expect("burn_pos event not emitted");
 
-        let data: (i32, i32, i128, i128, i128) = event.2.into_val(&env);
+        let __ver_5: (u32, (i32, i32, i128, i128, i128)) = event.2.into_val(&env);
+        assert_eq!(__ver_5.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (i32, i32, i128, i128, i128) = __ver_5.1;
         assert_eq!(
             data,
             (lower_tick, upper_tick, liquidity, amount_a, amount_b)
@@ -3961,7 +3950,9 @@ mod test_single_token_deposit {
             })
             .expect("mint_1t event must be emitted");
 
-        let data: (i32, i32, i128, i128, i128) = evt.2.into_val(&env);
+        let __ver_6: (u32, (i32, i32, i128, i128, i128)) = evt.2.into_val(&env);
+        assert_eq!(__ver_6.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (i32, i32, i128, i128, i128) = __ver_6.1;
         assert_eq!(data.0, 100_i32);
         assert_eq!(data.1, 200_i32);
         assert_eq!(data.2, result.liquidity);

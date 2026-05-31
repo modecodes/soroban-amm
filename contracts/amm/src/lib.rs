@@ -379,10 +379,7 @@ impl AmmPool {
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
 
         // Emit event for audit trail
-        env.events().publish(
-            (Symbol::new(&env, "emergency_withdraw"), admin.clone()),
-            (to, reserve_a, reserve_b),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "emergency_withdraw"), admin.clone()), (to, reserve_a, reserve_b));
 
         Ok(())
     }
@@ -430,10 +427,7 @@ impl AmmPool {
             .instance()
             .set(&DataKey::CircuitBreakerCooldown, &cooldown_secs);
 
-        env.events().publish(
-            (Symbol::new(&env, "cb_config"),),
-            (threshold_bps, cooldown_secs),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "cb_config"),), (threshold_bps, cooldown_secs));
 
         Ok(())
     }
@@ -573,10 +567,7 @@ impl AmmPool {
                 .instance()
                 .set(&DataKey::CircuitBreakerTriggeredAt, &now);
 
-            env.events().publish(
-                (Symbol::new(&env, "circuit_break"),),
-                (baseline_price, current_price, deviation_bps, threshold_bps),
-            );
+            soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "circuit_break"),), (baseline_price, current_price, deviation_bps, threshold_bps));
 
             return Err(AmmError::CircuitBreaker);
         }
@@ -670,10 +661,7 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::FlashLoanFeeBps, &new_fee_bps);
-        env.events().publish(
-            (Symbol::new(&env, "flash_fee_upd"), admin.clone()),
-            (new_fee_bps,),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "flash_fee_upd"), admin.clone()), (new_fee_bps,));
         Ok(())
     }
 
@@ -691,10 +679,7 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
-        env.events().publish(
-            (Symbol::new(&env, "admin_nominated"),),
-            (current_admin, new_admin),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "admin_nominated"),), (current_admin, new_admin));
         Ok(())
     }
 
@@ -953,10 +938,7 @@ impl AmmPool {
         let lp_client = LpTokenClient::new(&env, &lp_token);
         lp_client.mint(&provider, &shares);
 
-        env.events().publish(
-            (Symbol::new(&env, "add_liquidity"), provider),
-            (amount_a, amount_b, shares),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "add_liquidity"), provider), (amount_a, amount_b, shares));
 
         Ok(shares)
     }
@@ -1054,10 +1036,7 @@ impl AmmPool {
         client_a.transfer(&env.current_contract_address(), &provider, &out_a);
         client_b.transfer(&env.current_contract_address(), &provider, &out_b);
 
-        env.events().publish(
-            (symbol_short!("rm_liq"),),
-            (provider.clone(), shares, out_a, out_b),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("rm_liq"),), (provider.clone(), shares, out_a, out_b));
 
         Ok((out_a, out_b))
     }
@@ -1263,10 +1242,7 @@ impl AmmPool {
         let client_out = SepTokenClient::new(&env, &token_out);
         client_out.transfer(&env.current_contract_address(), &provider, &total_out);
 
-        env.events().publish(
-            (symbol_short!("rm_liq_1s"),),
-            (provider.clone(), shares, token_out.clone(), total_out),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("rm_liq_1s"),), (provider.clone(), shares, token_out.clone(), total_out));
 
         Ok(total_out)
     }
@@ -1426,10 +1402,7 @@ impl AmmPool {
             }
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "swap"), trader),
-            (token_in, amount_in, token_out, amount_out, referrer),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "swap"), trader), (token_in, amount_in, token_out, amount_out, referrer));
 
         Ok(amount_out)
     }
@@ -1564,10 +1537,7 @@ impl AmmPool {
             }
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "swap"), trader),
-            (token_in, amount_in, token_out, amount_out, referrer),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "swap"), trader), (token_in, amount_in, token_out, amount_out, referrer));
 
         Ok(amount_in)
     }
@@ -1717,10 +1687,7 @@ impl AmmPool {
                 .set(&DataKey::ReserveB, &reserve_after);
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "flash_loan"), receiver),
-            (token, amount, fee),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "flash_loan"), receiver), (token, amount, fee));
 
         // Release the lock only on the success path; on error paths Soroban
         // reverts all storage writes (including the lock) automatically.
@@ -2081,16 +2048,10 @@ impl AmmPool {
         }
 
         if actual_received < amount_in {
-            env.events().publish(
-                (Symbol::new(&env, "fot_detected"), token_in.clone()),
-                (amount_in, actual_received),
-            );
+            soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "fot_detected"), token_in.clone()), (amount_in, actual_received));
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "swap"), trader),
-            (token_in, actual_received, token_out, amount_out, referrer),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "swap"), trader), (token_in, actual_received, token_out, amount_out, referrer));
 
         Ok((amount_out, actual_received))
     }
@@ -2187,10 +2148,7 @@ impl AmmPool {
 
         LpTokenClient::new(&env, &lp_token).mint(&provider, &shares);
 
-        env.events().publish(
-            (Symbol::new(&env, "add_liquidity"), provider),
-            (actual_a, actual_b, shares),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "add_liquidity"), provider), (actual_a, actual_b, shares));
 
         Ok(shares)
     }
@@ -3118,7 +3076,9 @@ pub(crate) mod tests {
             .iter()
             .find(|e| e.0 == amm.address && e.1 == vec![env, symbol_short!("rm_liq")].into_val(env))
             .expect("remove_liquidity event not found");
-        let data: (Address, i128, i128, i128) = rm_liq_event.2.into_val(env);
+        let __ver_0: (u32, (Address, i128, i128, i128)) = rm_liq_event.2.into_val(env);
+        assert_eq!(__ver_0.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (Address, i128, i128, i128) = __ver_0.1;
         let expected = (provider.clone(), shares, out_a, out_b);
         assert_eq!(data, expected);
     }
@@ -3158,7 +3118,9 @@ pub(crate) mod tests {
             })
             .expect("swap event not found");
 
-        let data: (Address, i128, Address, i128) = swap_event.2.into_val(env);
+        let __ver_1: (u32, (Address, i128, Address, i128)) = swap_event.2.into_val(env);
+        assert_eq!(__ver_1.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (Address, i128, Address, i128) = __ver_1.1;
         let expected = (
             ts.ta_addr.clone(),
             amount_in,
@@ -4448,7 +4410,9 @@ mod prop_tests {
             })
             .expect("admin_nominated event not found");
 
-        let data: (Address, Address) = evt.2.into_val(env);
+        let __ver_2: (u32, (Address, Address)) = evt.2.into_val(env);
+        assert_eq!(__ver_2.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (Address, Address) = __ver_2.1;
         assert_eq!(data, (ts.admin.clone(), nominee.clone()));
     }
 
@@ -4474,7 +4438,9 @@ mod prop_tests {
             })
             .expect("admin_changed event not found");
 
-        let data: (Address,) = evt.2.into_val(env);
+        let __ver_3: (u32, (Address,)) = evt.2.into_val(env);
+        assert_eq!(__ver_3.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (Address,) = __ver_3.1;
         assert_eq!(data, (nominee,));
     }
     // Issue #193: simulate_swap price_impact_bps grows for large swaps.
