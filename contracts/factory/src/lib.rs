@@ -290,16 +290,13 @@ impl Factory {
         all.push_back(pool_addr.clone());
         env.storage().instance().set(&DataKey::AllPools, &all);
 
-        env.events().publish(
-            (Symbol::new(&env, "pool_created"),),
-            (
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "pool_created"),), (
                 ta.clone(),
                 tb.clone(),
                 pool_addr.clone(),
                 fee_bps,
                 lp_addr.clone(),
-            ),
-        );
+            ));
 
         Ok((pool_addr, gov_addr))
     }
@@ -326,10 +323,7 @@ impl Factory {
         if let Some(ref h) = token_wasm_hash {
             env.storage().instance().set(&DataKey::TokenWasmHash, h);
         }
-        env.events().publish(
-            (Symbol::new(&env, "wasm_updated"),),
-            (amm_wasm_hash, token_wasm_hash),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "wasm_updated"),), (amm_wasm_hash, token_wasm_hash));
         Ok(())
     }
 
@@ -435,10 +429,7 @@ impl Factory {
 
         env.storage().instance().set(&cl_key, &pool_addr);
 
-        env.events().publish(
-            (Symbol::new(&env, "cl_pool_created"),),
-            (ta.clone(), tb.clone(), fee_bps, pool_addr.clone()),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "cl_pool_created"),), (ta.clone(), tb.clone(), fee_bps, pool_addr.clone()));
 
         Ok(pool_addr)
     }
@@ -459,10 +450,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::PermissionlessMode, &enabled);
-        env.events().publish(
-            (Symbol::new(&env, "mode_changed"),),
-            (enabled,),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "mode_changed"),), (enabled,));
         Ok(())
     }
 
@@ -487,10 +475,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::PoolCreationFee, &fee_amount);
-        env.events().publish(
-            (Symbol::new(&env, "creation_fee_set"),),
-            (fee_token, fee_amount),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "creation_fee_set"),), (fee_token, fee_amount));
         Ok(())
     }
 
@@ -655,10 +640,7 @@ impl Factory {
 
         token::Client::new(env, &fee_token).transfer(caller, treasury, &fee_amount);
 
-        env.events().publish(
-            (Symbol::new(env, "creation_fee_paid"),),
-            (caller.clone(), fee_amount),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(env, "creation_fee_paid"),), (caller.clone(), fee_amount));
 
         Ok(())
     }
@@ -1095,7 +1077,9 @@ mod tests {
         // The event data is (token_a, token_b, pool_address, fee_bps, lp_token_address).
         // Normalised token order may differ — just assert pool and fee_bps fields.
         let lp_addr = factory.get_lp_token(&pool_addr).unwrap();
-        let data: (Address, Address, Address, i128, Address) = event.2.into_val(&env);
+        let __ver_12: (u32, (Address, Address, Address, i128, Address)) = event.2.into_val(&env);
+        assert_eq!(__ver_12.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (Address, Address, Address, i128, Address) = __ver_12.1;
         assert_eq!(data.2, pool_addr,   "pool address in event must match");
         assert_eq!(data.3, 30_i128,     "fee_bps in event must be 30");
         assert_eq!(data.4, lp_addr,     "lp_token address in event must match");
