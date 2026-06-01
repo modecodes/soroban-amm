@@ -363,6 +363,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dex-aggregator"
+version = "0.1.0"
+dependencies = [
+ "amm",
+ "factory",
+ "soroban-sdk",
+ "token",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -685,6 +695,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "incentive-campaigns"
+version = "0.1.0"
+dependencies = [
+ "amm",
+ "soroban-sdk",
+ "token",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -719,10 +738,13 @@ version = "0.1.0"
 dependencies = [
  "amm",
  "concentrated_liquidity",
+ "dex-aggregator",
  "factory",
  "governance",
+ "incentive-campaigns",
  "soroban-sdk",
  "token",
+ "twal-consumer",
  "twap-consumer",
 ]
 
@@ -1280,6 +1302,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "soroban-amm-sdk"
+version = "0.1.0"
+dependencies = [
+ "amm",
+ "soroban-sdk",
+ "token",
+]
+
+[[package]]
 name = "soroban-builtin-sdk-macros"
 version = "21.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1615,6 +1646,15 @@ name = "token"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+]
+
+[[package]]
+name = "twal-consumer"
+version = "0.1.0"
+dependencies = [
+ "amm",
+ "soroban-sdk",
+ "token",
 ]
 
 [[package]]

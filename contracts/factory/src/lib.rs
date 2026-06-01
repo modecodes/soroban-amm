@@ -10,8 +10,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracterror, contracttype, Address, BytesN, Env,
-    Symbol, Vec,
+    contract, contractclient, contractimpl, contracterror, contracttype, token, Address, BytesN,
+    Env, Symbol, Vec,
 };
 
 // ── Typed errors ─────────────────────────────────────────────────────────────
@@ -25,6 +25,8 @@ pub enum FactoryError {
     ClPoolAlreadyExists = 4,
     ClWasmNotSet        = 5,
     Unauthorized        = 6,
+    FeeNotConfigured    = 7,
+    RateLimitExceeded   = 8,
 }
 
 #[contractclient(name = "ClPoolClient")]
@@ -96,6 +98,11 @@ pub enum DataKey {
     PoolCount,                       // u64 monotonic counter — used to derive unique deploy salts
     GovernanceFor(Address),          // pool address → Option<Address>
     ClPool(Address, Address, i128),  // normalized (token_a, token_b, fee_bps) → CL pool Address
+    PermissionlessMode,              // bool — true = anyone can create pools (with fee)
+    PoolCreationFee,                 // i128 — fee charged per pool in permissionless mode
+    FeeToken,                        // Address — token used to pay the pool creation fee
+    RateLimitLedgers,                // u32 — minimum ledgers between pool creations per address
+    LastPoolCreation(Address),       // u32 — ledger when this address last created a pool
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -131,28 +138,66 @@ impl Factory {
             .instance()
             .set(&DataKey::AllPools, &Vec::<Address>::new(&env));
         env.storage().instance().set(&DataKey::PoolCount, &0u64);
+        // Initialize default fee tier to Medium (0.3% = 30 bps)
+        env.storage().instance().set(&DataKey::DefaultFeeTier, &2i128);
         Ok(())
     }
 
     // ── Pool creation ─────────────────────────────────────────────────────────
 
-    /// Deploy a new AMM pool for `(token_a, token_b)` with `fee_bps` swap fee.
+    /// Deploy a new AMM pool for `(token_a, token_b)` with the specified fee tier.
     ///
     /// Token pair order is normalised — the pool is always stored with the
     /// lexicographically smaller address as `token_a`, so callers do not need
     /// to match the original order when looking up a pool.
     ///
-    /// `lp_name` and `lp_symbol` set the LP token's metadata. When `None` the
-    /// factory generates counter-based defaults: `"AMM LP Token #N"` / `"ALPN"`.
+    /// `caller` is the address initiating the call. In permissioned mode the
+    /// factory admin must be the caller. In permissionless mode any address may
+    /// create a pool, but they must pay the configured `PoolCreationFee` in
+    /// `FeeToken` to the protocol treasury (factory admin), and are subject to
+    /// a per-address rate limit.
     ///
     /// Panics if a pool for this pair already exists.
     pub fn create_pool(
+        env: Env,
+        caller: Address,
+        token_a: Address,
+        token_b: Address,
+        fee_tier: i128,
+        governance_wasm_hash: Option<BytesN<32>>,
+    ) -> Result<(Address, Option<Address>), FactoryError> {
+        let fee_bps = fee_tier_to_bps(fee_tier)?;
+        Self::create_pool_with_fee_bps(env, token_a, token_b, fee_bps, governance_wasm_hash)
+    }
+
+    /// Deploy a new AMM pool for `(token_a, token_b)` with a custom fee in basis points.
+    ///
+    /// This allows pools to be created with custom fees outside the standard tiers.
+    /// For most use cases, prefer `create_pool` with a standard fee tier.
+    ///
+    /// Token pair order is normalised. Panics if a pool for this pair already exists.
+    pub fn create_pool_with_fee_bps(
         env: Env,
         token_a: Address,
         token_b: Address,
         fee_bps: i128,
         governance_wasm_hash: Option<BytesN<32>>,
     ) -> Result<(Address, Option<Address>), FactoryError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let permissionless: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PermissionlessMode)
+            .unwrap_or(false);
+
+        if permissionless {
+            caller.require_auth();
+            Self::check_and_update_rate_limit(&env, &caller)?;
+            Self::charge_pool_creation_fee(&env, &caller, &admin)?;
+        } else {
+            admin.require_auth();
+        }
+
         // Normalise: smaller address is always token_a.
         let (ta, tb) = if token_a < token_b {
             (token_a, token_b)
@@ -178,7 +223,6 @@ impl Factory {
             .instance()
             .get(&DataKey::TokenWasmHash)
             .unwrap();
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
 
         // Derive salts per pool from a monotonic counter.
         // We use n * 3 for LP salt, n * 3 + 1 for Pool salt, n * 3 + 2 for Governance salt.
@@ -265,16 +309,13 @@ impl Factory {
         all.push_back(pool_addr.clone());
         env.storage().instance().set(&DataKey::AllPools, &all);
 
-        env.events().publish(
-            (Symbol::new(&env, "pool_created"),),
-            (
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "pool_created"),), (
                 ta.clone(),
                 tb.clone(),
                 pool_addr.clone(),
                 fee_bps,
                 lp_addr.clone(),
-            ),
-        );
+            ));
 
         Ok((pool_addr, gov_addr))
     }
@@ -301,9 +342,26 @@ impl Factory {
         if let Some(ref h) = token_wasm_hash {
             env.storage().instance().set(&DataKey::TokenWasmHash, h);
         }
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "wasm_updated"),), (amm_wasm_hash, token_wasm_hash));
+        Ok(())
+    }
+
+    /// Set the default fee tier for new pool deployments. Admin-only.
+    ///
+    /// `fee_tier` must be 0-3 (VeryLow, Low, Medium, High).
+    /// Existing pools are unaffected; only pools created after this call
+    /// will use the new default tier.
+    pub fn set_default_fee_tier(env: Env, fee_tier: i128) -> Result<(), FactoryError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        
+        // Validate the fee tier
+        fee_tier_to_bps(fee_tier)?;
+        
+        env.storage().instance().set(&DataKey::DefaultFeeTier, &fee_tier);
         env.events().publish(
-            (Symbol::new(&env, "wasm_updated"),),
-            (amm_wasm_hash, token_wasm_hash),
+            (Symbol::new(&env, "default_fee_tier_updated"),),
+            (fee_tier,),
         );
         Ok(())
     }
@@ -338,13 +396,31 @@ impl Factory {
     ///
     /// Unlike V2 pools, no LP token is deployed — positions are tracked on-chain by
     /// the CL contract itself.
+    ///
+    /// Applies the same permissioned/permissionless access controls as `create_pool`.
     pub fn create_cl_pool(
         env: Env,
+        caller: Address,
         token_a: Address,
         token_b: Address,
         fee_bps: i128,
         initial_tick: i32,
     ) -> Result<Address, FactoryError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let permissionless: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PermissionlessMode)
+            .unwrap_or(false);
+
+        if permissionless {
+            caller.require_auth();
+            Self::check_and_update_rate_limit(&env, &caller)?;
+            Self::charge_pool_creation_fee(&env, &caller, &admin)?;
+        } else {
+            admin.require_auth();
+        }
+
         if !(0..=10_000).contains(&fee_bps) {
             return Err(FactoryError::InvalidFeeBps);
         }
@@ -381,7 +457,6 @@ impl Factory {
             .with_current_contract(cl_salt)
             .deploy(cl_wasm);
 
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         // Derive tick_spacing from fee tier (matching Uniswap v3 conventions).
         let tick_spacing: i32 = match fee_bps {
             5   => 1,
@@ -393,15 +468,88 @@ impl Factory {
 
         env.storage().instance().set(&cl_key, &pool_addr);
 
-        env.events().publish(
-            (Symbol::new(&env, "cl_pool_created"),),
-            (ta.clone(), tb.clone(), fee_bps, pool_addr.clone()),
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "cl_pool_created"),), (ta.clone(), tb.clone(), fee_bps, pool_addr.clone()));
 
         Ok(pool_addr)
     }
 
+    // ── Pool-creation mode ────────────────────────────────────────────────────
+
+    /// Toggle between permissioned (admin-only) and permissionless pool creation. Admin-only.
+    ///
+    /// When `enabled` is `true`, any address may call `create_pool` / `create_cl_pool`
+    /// provided they pay the configured creation fee. When `false` (default), only the
+    /// factory admin may create pools.
+    ///
+    /// The pool creation fee and fee token must be set via `set_pool_creation_fee`
+    /// before enabling permissionless mode.
+    pub fn set_permissionless_mode(env: Env, enabled: bool) -> Result<(), FactoryError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PermissionlessMode, &enabled);
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "mode_changed"),), (enabled,));
+        Ok(())
+    }
+
+    /// Configure the fee charged per pool creation in permissionless mode. Admin-only.
+    ///
+    /// `fee_token` is the SEP-41 token address used for payment (e.g. XLM/native).
+    /// `fee_amount` is the amount in the token's smallest unit; must be > 0.
+    /// Fees are transferred to the factory admin (protocol treasury) on each creation.
+    pub fn set_pool_creation_fee(
+        env: Env,
+        fee_token: Address,
+        fee_amount: i128,
+    ) -> Result<(), FactoryError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if fee_amount <= 0 {
+            return Err(FactoryError::FeeNotConfigured);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeToken, &fee_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolCreationFee, &fee_amount);
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "creation_fee_set"),), (fee_token, fee_amount));
+        Ok(())
+    }
+
+    /// Set the minimum ledger gap between pool creations per address. Admin-only.
+    ///
+    /// Defaults to 1 (one pool per ledger per address). Increase to slow down
+    /// burst creation attempts. Set to 0 to disable rate limiting.
+    pub fn set_rate_limit(env: Env, min_ledgers: u32) -> Result<(), FactoryError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::RateLimitLedgers, &min_ledgers);
+        Ok(())
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
+
+    /// Return whether permissionless pool creation is currently enabled.
+    pub fn is_permissionless(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::PermissionlessMode)
+            .unwrap_or(false)
+    }
+
+    /// Return the current pool creation fee `(fee_token, fee_amount)`, or `None` if unset.
+    pub fn get_pool_creation_fee(env: Env) -> Option<(Address, i128)> {
+        let token: Option<Address> = env.storage().instance().get(&DataKey::FeeToken);
+        let amount: Option<i128> = env.storage().instance().get(&DataKey::PoolCreationFee);
+        match (token, amount) {
+            (Some(t), Some(a)) => Some((t, a)),
+            _ => None,
+        }
+    }
 
     /// Return the LP token address for the given pool, or `None` if unknown.
     pub fn get_lp_token(env: Env, pool: Address) -> Option<Address> {
@@ -414,6 +562,28 @@ impl Factory {
             .instance()
             .get(&DataKey::GovernanceFor(pool))
             .unwrap_or(None)
+    }
+
+    /// Return the current default fee tier.
+    ///
+    /// Returns the fee tier ID (0-3) that will be used for new pools
+    /// if no specific tier is provided to `create_pool`.
+    pub fn get_default_fee_tier(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultFeeTier)
+            .unwrap_or(2) // Default to Medium (0.3%) if not set
+    }
+
+    /// Convert a fee tier ID to its basis points value.
+    ///
+    /// # Returns
+    /// - 0 → 1 bps (0.01%)
+    /// - 1 → 5 bps (0.05%)
+    /// - 2 → 30 bps (0.3%)
+    /// - 3 → 100 bps (1.0%)
+    pub fn get_fee_tier_bps(env: Env, fee_tier: i128) -> Result<i128, FactoryError> {
+        fee_tier_to_bps(fee_tier)
     }
 
     /// Return the pool address for `(token_a, token_b)`, or `None` if it does
@@ -475,6 +645,66 @@ impl Factory {
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
+
+    /// Enforce per-address rate limiting for permissionless pool creation.
+    ///
+    /// Reads `RateLimitLedgers` (default 1). If the caller created a pool within
+    /// that many ledgers, returns `RateLimitExceeded`. On success, records the
+    /// current ledger for the caller.
+    fn check_and_update_rate_limit(env: &Env, caller: &Address) -> Result<(), FactoryError> {
+        let min_gap: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateLimitLedgers)
+            .unwrap_or(1u32);
+
+        if min_gap > 0 {
+            let current_ledger = env.ledger().sequence();
+            let last: Option<u32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LastPoolCreation(caller.clone()));
+
+            if let Some(last_ledger) = last {
+                if current_ledger.saturating_sub(last_ledger) < min_gap {
+                    return Err(FactoryError::RateLimitExceeded);
+                }
+            }
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::LastPoolCreation(caller.clone()), &current_ledger);
+        }
+
+        Ok(())
+    }
+
+    /// Transfer the pool creation fee from `caller` to `treasury`.
+    ///
+    /// Requires `FeeToken` and `PoolCreationFee` to be set, otherwise returns
+    /// `FeeNotConfigured`. The caller must have authorised the token transfer.
+    fn charge_pool_creation_fee(
+        env: &Env,
+        caller: &Address,
+        treasury: &Address,
+    ) -> Result<(), FactoryError> {
+        let fee_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeToken)
+            .ok_or(FactoryError::FeeNotConfigured)?;
+        let fee_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCreationFee)
+            .ok_or(FactoryError::FeeNotConfigured)?;
+
+        token::Client::new(env, &fee_token).transfer(caller, treasury, &fee_amount);
+
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(env, "creation_fee_paid"),), (caller.clone(), fee_amount));
+
+        Ok(())
+    }
 
     /// Build a deterministic 32-byte salt from a u64 index.
     fn make_salt(env: &Env, index: u64) -> BytesN<32> {
@@ -554,7 +784,7 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        let (pool, gov) = factory.create_pool(&ta, &tb, &30_i128, &None);
+        let (pool, gov) = factory.create_pool(&admin, &ta, &tb, &30_i128, &None);
 
         assert_eq!(factory.get_pool(&ta, &tb), Some(pool.clone()));
         assert_eq!(factory.all_pools().len(), 1);
@@ -580,7 +810,7 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        let (pool, gov) = factory.create_pool(&ta, &tb, &30_i128, &Some(gov_hash));
+        let (pool, gov) = factory.create_pool(&admin, &ta, &tb, &30_i128, &Some(gov_hash));
 
         assert_eq!(factory.get_pool(&ta, &tb), Some(pool.clone()));
         assert_eq!(factory.all_pools().len(), 1);
@@ -605,7 +835,7 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128, &None);
+        factory.create_pool(&admin, &ta, &tb, &30_i128, &None);
 
         // Reverse-order lookup returns the same pool.
         assert_eq!(factory.get_pool(&ta, &tb), factory.get_pool(&tb, &ta));
@@ -628,8 +858,8 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128, &None);
-        let result = factory.try_create_pool(&ta, &tb, &30_i128, &None);
+        factory.create_pool(&admin, &ta, &tb, &30_i128, &None);
+        let result = factory.try_create_pool(&admin, &ta, &tb, &30_i128, &None);
         assert!(result.is_err());
     }
 
@@ -653,10 +883,10 @@ mod tests {
         let tb = Address::generate(&env);
         let tc = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128, &None);
+        factory.create_pool(&admin, &ta, &tb, &30_i128, &None);
         assert_eq!(factory.all_pools().len(), 1);
 
-        factory.create_pool(&ta, &tc, &30_i128, &None);
+        factory.create_pool(&admin, &ta, &tc, &30_i128, &None);
         assert_eq!(factory.all_pools().len(), 2);
     }
 
@@ -680,8 +910,8 @@ mod tests {
         let tb = Address::generate(&env);
         let tc = Address::generate(&env);
 
-        let (pool0, _) = factory.create_pool(&ta, &tb, &30_i128, &None);
-        let (pool1, _) = factory.create_pool(&ta, &tc, &30_i128, &None);
+        let (pool0, _) = factory.create_pool(&admin, &ta, &tb, &30_i128, &None);
+        let (pool1, _) = factory.create_pool(&admin, &ta, &tc, &30_i128, &None);
 
         // Fetch LP token addresses via the factory's registry.
         let lp0 = factory.get_lp_token(&pool0).unwrap();
@@ -740,7 +970,7 @@ mod tests {
         // Pool creation still works after an update.
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
-        let (pool, _) = factory.create_pool(&ta, &tb, &30_i128, &None);
+        let (pool, _) = factory.create_pool(&admin, &ta, &tb, &30_i128, &None);
         assert!(factory.get_pool(&ta, &tb).is_some());
         assert!(factory.get_lp_token(&pool).is_some());
 
@@ -773,8 +1003,8 @@ mod tests {
         let tb = Address::generate(&env);
 
         // Deploy same pair at two different fee tiers.
-        let pool_30 = factory.create_cl_pool(&ta, &tb, &30_i128, &0_i32);
-        let pool_100 = factory.create_cl_pool(&ta, &tb, &100_i128, &0_i32);
+        let pool_30 = factory.create_cl_pool(&admin, &ta, &tb, &30_i128, &0_i32);
+        let pool_100 = factory.create_cl_pool(&admin, &ta, &tb, &100_i128, &0_i32);
 
         // Both pools are distinct addresses.
         assert_ne!(pool_30, pool_100);
@@ -809,8 +1039,8 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        factory.create_cl_pool(&ta, &tb, &30_i128, &0_i32);
-        let result = factory.try_create_cl_pool(&ta, &tb, &30_i128, &0_i32);
+        factory.create_cl_pool(&admin, &ta, &tb, &30_i128, &0_i32);
+        let result = factory.try_create_cl_pool(&admin, &ta, &tb, &30_i128, &0_i32);
         assert!(result.is_err());
     }
 
@@ -836,13 +1066,13 @@ mod tests {
         let tc = Address::generate(&env);
         let td = Address::generate(&env);
 
-        let (pool1, _) = factory.create_pool(&ta, &tb, &30_i128, &None);
+        let (pool1, _) = factory.create_pool(&admin, &ta, &tb, &30_i128, &None);
         assert_eq!(factory.get_pool_count(), 1);
 
-        let (pool2, _) = factory.create_pool(&ta, &tc, &30_i128, &None);
+        let (pool2, _) = factory.create_pool(&admin, &ta, &tc, &30_i128, &None);
         assert_eq!(factory.get_pool_count(), 2);
 
-        let (pool3, _) = factory.create_pool(&ta, &td, &30_i128, &None);
+        let (pool3, _) = factory.create_pool(&admin, &ta, &td, &30_i128, &None);
         assert_eq!(factory.get_pool_count(), 3);
 
         // Page 1: first two pools.
@@ -893,7 +1123,7 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        let (pool_addr, _) = factory.create_pool(&ta, &tb, &30_i128, &None);
+        let (pool_addr, _) = factory.create_pool(&admin, &ta, &tb, &30_i128, &None);
 
         // Locate the pool_created event.
         let events = env.events().all();
@@ -908,7 +1138,9 @@ mod tests {
         // The event data is (token_a, token_b, pool_address, fee_bps, lp_token_address).
         // Normalised token order may differ — just assert pool and fee_bps fields.
         let lp_addr = factory.get_lp_token(&pool_addr).unwrap();
-        let data: (Address, Address, Address, i128, Address) = event.2.into_val(&env);
+        let __ver_12: (u32, (Address, Address, Address, i128, Address)) = event.2.into_val(&env);
+        assert_eq!(__ver_12.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        let data: (Address, Address, Address, i128, Address) = __ver_12.1;
         assert_eq!(data.2, pool_addr,   "pool address in event must match");
         assert_eq!(data.3, 30_i128,     "fee_bps in event must be 30");
         assert_eq!(data.4, lp_addr,     "lp_token address in event must match");
@@ -934,14 +1166,14 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128, &None);
+        factory.create_pool(&admin, &ta, &tb, &30_i128, &None);
 
         // Clear events so we only see events from the second (failing) call.
         // Soroban test env accumulates events — count before the duplicate attempt.
         let count_before = env.events().all().len();
 
         // Duplicate call must fail.
-        let result = factory.try_create_pool(&ta, &tb, &30_i128, &None);
+        let result = factory.try_create_pool(&admin, &ta, &tb, &30_i128, &None);
         assert!(result.is_err(), "duplicate pool creation must fail");
 
         // No new events must have been added.
@@ -951,4 +1183,207 @@ mod tests {
             "no event should be emitted when create_pool reverts"
         );
     }
+
+    // ── Permissionless pool creation ──────────────────────────────────────────
+
+    fn setup_fee_token(env: &Env, admin: &Address, user: &Address, amount: i128) -> Address {
+        let fee_token_addr = env.register_contract(None, token::LpToken);
+        token::LpTokenClient::new(env, &fee_token_addr).initialize(
+            admin,
+            &soroban_sdk::String::from_str(env, "Fee Token"),
+            &soroban_sdk::String::from_str(env, "FEE"),
+            &7u32,
+        );
+        token::LpTokenClient::new(env, &fee_token_addr).mint(user, &amount);
+        fee_token_addr
+    }
+
+    #[test]
+    fn test_permissioned_mode_blocks_non_admin() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        // Do NOT mock_all_auths — we need real auth checks.
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        // Initialize requires admin auth.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &factory_addr,
+                fn_name: "initialize",
+                args: (&admin, &amm_hash, &token_hash).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        // Default mode is permissioned; a non-admin caller must be rejected.
+        assert!(!factory.is_permissionless());
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        // user tries to create a pool in permissioned mode — must fail.
+        let result = factory.try_create_pool(&user, &ta, &tb, &30_i128, &None);
+        assert!(result.is_err(), "non-admin must not create pools in permissioned mode");
+    }
+
+    #[test]
+    fn test_permissionless_mode_toggle() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        assert!(!factory.is_permissionless());
+        factory.set_permissionless_mode(&true);
+        assert!(factory.is_permissionless());
+        factory.set_permissionless_mode(&false);
+        assert!(!factory.is_permissionless());
+    }
+
+    #[test]
+    fn test_permissionless_charges_fee() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        // Deploy a fee token and mint 1000 units to user.
+        let fee_token_addr = setup_fee_token(&env, &admin, &user, 1000);
+        let fee_client = soroban_sdk::token::Client::new(&env, &fee_token_addr);
+
+        let fee_amount: i128 = 100;
+        factory.set_pool_creation_fee(&fee_token_addr, &fee_amount);
+        factory.set_permissionless_mode(&true);
+
+        assert_eq!(
+            factory.get_pool_creation_fee(),
+            Some((fee_token_addr.clone(), fee_amount))
+        );
+
+        let user_balance_before = fee_client.balance(&user);
+        let admin_balance_before = fee_client.balance(&admin);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let (pool, _) = factory.create_pool(&user, &ta, &tb, &30_i128, &None);
+
+        assert!(factory.get_pool(&ta, &tb).is_some());
+        // Fee transferred from user to admin (treasury).
+        assert_eq!(fee_client.balance(&user), user_balance_before - fee_amount);
+        assert_eq!(fee_client.balance(&admin), admin_balance_before + fee_amount);
+    }
+
+    #[test]
+    fn test_permissionless_fee_not_configured_fails() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        // Enable permissionless without setting a fee — must fail on pool creation.
+        factory.set_permissionless_mode(&true);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let result = factory.try_create_pool(&user, &ta, &tb, &30_i128, &None);
+        assert!(result.is_err(), "pool creation without configured fee must fail");
+    }
+
+    #[test]
+    fn test_rate_limit_blocks_rapid_creation() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let fee_token_addr = setup_fee_token(&env, &admin, &user, 10_000);
+        factory.set_pool_creation_fee(&fee_token_addr, &100_i128);
+        factory.set_permissionless_mode(&true);
+        // Require 5 ledger gap between creations.
+        factory.set_rate_limit(&5u32);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let tc = Address::generate(&env);
+
+        // First creation succeeds.
+        factory.create_pool(&user, &ta, &tb, &30_i128, &None);
+
+        // Immediate second creation by the same user must be rate-limited.
+        let result = factory.try_create_pool(&user, &ta, &tc, &30_i128, &None);
+        assert!(result.is_err(), "second pool creation within rate limit window must fail");
+    }
+
+    #[test]
+    fn test_rate_limit_zero_disables_limit() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let fee_token_addr = setup_fee_token(&env, &admin, &user, 10_000);
+        factory.set_pool_creation_fee(&fee_token_addr, &100_i128);
+        factory.set_permissionless_mode(&true);
+        factory.set_rate_limit(&0u32); // disable rate limiting
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let tc = Address::generate(&env);
+
+        // Both creations must succeed on the same ledger.
+        factory.create_pool(&user, &ta, &tb, &30_i128, &None);
+        factory.create_pool(&user, &ta, &tc, &30_i128, &None);
+        assert_eq!(factory.all_pools().len(), 2);
+    }
 }
+
