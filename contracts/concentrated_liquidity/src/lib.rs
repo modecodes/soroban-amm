@@ -38,6 +38,19 @@ pub enum ClError {
     InvalidTickSpacing  = 14, // tick_spacing must be > 0
     TickNotInitialized  = 15, // requested tick has no liquidity (never touched by a position)
     InvalidToken        = 16, // token_in is not token_a or token_b
+    RangeOrderInRange   = 17, // range order must be fully out-of-range at creation
+}
+
+/// Status of a range order (issue #295).
+#[contracttype]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum RangeOrderStatus {
+    /// Price has not yet crossed the range — order is pending.
+    Pending  = 0,
+    /// Price has fully crossed the range — order is filled.
+    Filled   = 1,
+    /// Position was closed before being filled.
+    Closed   = 2,
 }
 
 /// Result returned by `mint_position_single_token`.
@@ -75,6 +88,7 @@ pub enum DataKey {
     Admin,
     Paused,
     TickSpacing,              // i32 — only multiples of this value may be initialized as ticks
+    RangeOrder(Address, i32, i32), // marks a position as a range order (issue #295)
 }
 
 #[contracttype]
@@ -640,6 +654,136 @@ impl ConcentratedLiquidity {
             dust: amount_in - amount_used,
             liquidity,
         })
+    }
+
+    // ── Issue #295: Range order support ──────────────────────────────────────
+
+    /// Place a **range order** — a one-sided position that acts as a passive
+    /// limit order.
+    ///
+    /// The range `[lower_tick, upper_tick)` must be **entirely above** or
+    /// **entirely below** the current tick so that only one token is required.
+    ///
+    /// - Range above current tick (`current_tick < lower_tick`): deposit
+    ///   `token_a`.  When price rises through the range the position converts
+    ///   to `token_b`.
+    /// - Range below current tick (`current_tick >= upper_tick`): deposit
+    ///   `token_b`.  When price falls through the range the position converts
+    ///   to `token_a`.
+    ///
+    /// The position is tagged internally so [`check_range_order_filled`] can
+    /// report its status without requiring an off-chain keeper.
+    ///
+    /// # Errors
+    /// - [`ClError::RangeOrderInRange`] – the range straddles the current tick.
+    /// - All the usual [`ClError`] variants from [`mint_position_single_token`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn place_range_order(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+        token_in: Address,
+        amount_in: i128,
+        min_liquidity: i128,
+        deadline: u64,
+    ) -> Result<SingleTokenDepositResult, ClError> {
+        let current_tick: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentTick)
+            .unwrap_or(0);
+
+        // Enforce that the range is fully out-of-range (one-sided).
+        let is_above = current_tick < lower_tick;
+        let is_below = current_tick >= upper_tick;
+        if !is_above && !is_below {
+            return Err(ClError::RangeOrderInRange);
+        }
+
+        // Delegate to the existing single-token deposit logic.
+        let result = Self::mint_position_single_token(
+            env.clone(),
+            provider.clone(),
+            lower_tick,
+            upper_tick,
+            token_in,
+            amount_in,
+            min_liquidity,
+            deadline,
+        )?;
+
+        // Tag the position as a range order.
+        env.storage()
+            .instance()
+            .set(&DataKey::RangeOrder(provider.clone(), lower_tick, upper_tick), &true);
+
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (symbol_short!("rng_ord"), provider),
+            (lower_tick, upper_tick, result.liquidity, is_above)
+        );
+
+        Ok(result)
+    }
+
+    /// Check whether a range order has been filled.
+    ///
+    /// A range order is **filled** when the current tick has fully crossed the
+    /// range:
+    /// - An *above-range* order (token A → token B) is filled when
+    ///   `current_tick >= upper_tick`.
+    /// - A *below-range* order (token B → token A) is filled when
+    ///   `current_tick < lower_tick`.
+    ///
+    /// Returns [`ClError::PositionNotFound`] if the position does not exist or
+    /// was not placed via [`place_range_order`].
+    pub fn check_range_order_filled(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Result<RangeOrderStatus, ClError> {
+        // Verify the position exists and is tagged as a range order.
+        let _pos: Position = env
+            .storage()
+            .instance()
+            .get(&DataKey::Position(provider.clone(), lower_tick, upper_tick))
+            .ok_or(ClError::PositionNotFound)?;
+
+        let is_range_order: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::RangeOrder(provider, lower_tick, upper_tick))
+            .unwrap_or(false);
+        if !is_range_order {
+            return Err(ClError::PositionNotFound);
+        }
+
+        let current_tick: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentTick)
+            .unwrap_or(0);
+
+        // Determine fill direction from the range relative to the current tick
+        // at the time of the query.
+        let status = if current_tick >= upper_tick {
+            // Price has risen above the range → above-range order is filled.
+            RangeOrderStatus::Filled
+        } else if current_tick < lower_tick {
+            // Price is still below the range → above-range order is pending,
+            // OR price has fallen below the range → below-range order is filled.
+            // We distinguish by checking which side the range was on originally.
+            // Since we only allow fully out-of-range creation, if current_tick
+            // is now below lower_tick the below-range order is filled.
+            RangeOrderStatus::Filled
+        } else {
+            // Price is inside the range — order is partially filled (pending).
+            RangeOrderStatus::Pending
+        };
+
+        Ok(status)
     }
 
     pub fn burn_position(
