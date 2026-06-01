@@ -186,6 +186,7 @@ pub struct UpdateProtocolFeeParams {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProposalKind {
     UpdateFee(i128),
+    UpdateFeeTier(i128),  // 0-3: VeryLow, Low, Medium, High
     UpdateProtocolFee(UpdateProtocolFeeParams),
     UpdateFlashLoanFee(i128),
     TransferAdmin(Address),
@@ -343,6 +344,10 @@ impl Governance {
                 if !(0..=MAX_BPS).contains(new_fee_bps) {
                     return Err(GovernanceError::InvalidFeeBps);
                 }
+            }
+            ProposalKind::UpdateFeeTier(fee_tier) => {
+                // Validate fee_tier is 0-3
+                Self::fee_tier_to_bps(*fee_tier)?;
             }
             ProposalKind::UpdateProtocolFee(params) => {
                 if !(0..=MAX_BPS).contains(&params.new_bps) {
@@ -566,6 +571,10 @@ impl Governance {
         match &proposal.kind {
             ProposalKind::UpdateFee(new_fee_bps) => {
                 amm_client.update_fee(new_fee_bps);
+            }
+            ProposalKind::UpdateFeeTier(fee_tier) => {
+                let new_fee_bps = Self::fee_tier_to_bps(*fee_tier)?;
+                amm_client.update_fee(&new_fee_bps);
             }
             ProposalKind::UpdateProtocolFee(params) => {
                 let self_addr = env.current_contract_address();
@@ -1053,6 +1062,23 @@ impl Governance {
         env.storage()
             .persistent()
             .extend_ttl(key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
+    }
+
+    /// Convert a fee tier ID (0-3) to its basis points value.
+    ///
+    /// Matches the fee tier definitions:
+    /// - 0 → 1 bps (0.01%)
+    /// - 1 → 5 bps (0.05%)
+    /// - 2 → 30 bps (0.3%)
+    /// - 3 → 100 bps (1.0%)
+    fn fee_tier_to_bps(fee_tier: i128) -> Result<i128, GovernanceError> {
+        match fee_tier {
+            0 => Ok(1),      // VeryLow: 0.01%
+            1 => Ok(5),      // Low: 0.05%
+            2 => Ok(30),     // Medium: 0.3%
+            3 => Ok(100),    // High: 1.0%
+            _ => Err(GovernanceError::InvalidFeeBps),
+        }
     }
 }
 

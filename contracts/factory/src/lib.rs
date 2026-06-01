@@ -138,12 +138,14 @@ impl Factory {
             .instance()
             .set(&DataKey::AllPools, &Vec::<Address>::new(&env));
         env.storage().instance().set(&DataKey::PoolCount, &0u64);
+        // Initialize default fee tier to Medium (0.3% = 30 bps)
+        env.storage().instance().set(&DataKey::DefaultFeeTier, &2i128);
         Ok(())
     }
 
     // ── Pool creation ─────────────────────────────────────────────────────────
 
-    /// Deploy a new AMM pool for `(token_a, token_b)` with `fee_bps` swap fee.
+    /// Deploy a new AMM pool for `(token_a, token_b)` with the specified fee tier.
     ///
     /// Token pair order is normalised — the pool is always stored with the
     /// lexicographically smaller address as `token_a`, so callers do not need
@@ -159,6 +161,23 @@ impl Factory {
     pub fn create_pool(
         env: Env,
         caller: Address,
+        token_a: Address,
+        token_b: Address,
+        fee_tier: i128,
+        governance_wasm_hash: Option<BytesN<32>>,
+    ) -> Result<(Address, Option<Address>), FactoryError> {
+        let fee_bps = fee_tier_to_bps(fee_tier)?;
+        Self::create_pool_with_fee_bps(env, token_a, token_b, fee_bps, governance_wasm_hash)
+    }
+
+    /// Deploy a new AMM pool for `(token_a, token_b)` with a custom fee in basis points.
+    ///
+    /// This allows pools to be created with custom fees outside the standard tiers.
+    /// For most use cases, prefer `create_pool` with a standard fee tier.
+    ///
+    /// Token pair order is normalised. Panics if a pool for this pair already exists.
+    pub fn create_pool_with_fee_bps(
+        env: Env,
         token_a: Address,
         token_b: Address,
         fee_bps: i128,
@@ -324,6 +343,26 @@ impl Factory {
             env.storage().instance().set(&DataKey::TokenWasmHash, h);
         }
         soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "wasm_updated"),), (amm_wasm_hash, token_wasm_hash));
+        Ok(())
+    }
+
+    /// Set the default fee tier for new pool deployments. Admin-only.
+    ///
+    /// `fee_tier` must be 0-3 (VeryLow, Low, Medium, High).
+    /// Existing pools are unaffected; only pools created after this call
+    /// will use the new default tier.
+    pub fn set_default_fee_tier(env: Env, fee_tier: i128) -> Result<(), FactoryError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        
+        // Validate the fee tier
+        fee_tier_to_bps(fee_tier)?;
+        
+        env.storage().instance().set(&DataKey::DefaultFeeTier, &fee_tier);
+        env.events().publish(
+            (Symbol::new(&env, "default_fee_tier_updated"),),
+            (fee_tier,),
+        );
         Ok(())
     }
 
@@ -523,6 +562,28 @@ impl Factory {
             .instance()
             .get(&DataKey::GovernanceFor(pool))
             .unwrap_or(None)
+    }
+
+    /// Return the current default fee tier.
+    ///
+    /// Returns the fee tier ID (0-3) that will be used for new pools
+    /// if no specific tier is provided to `create_pool`.
+    pub fn get_default_fee_tier(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultFeeTier)
+            .unwrap_or(2) // Default to Medium (0.3%) if not set
+    }
+
+    /// Convert a fee tier ID to its basis points value.
+    ///
+    /// # Returns
+    /// - 0 → 1 bps (0.01%)
+    /// - 1 → 5 bps (0.05%)
+    /// - 2 → 30 bps (0.3%)
+    /// - 3 → 100 bps (1.0%)
+    pub fn get_fee_tier_bps(env: Env, fee_tier: i128) -> Result<i128, FactoryError> {
+        fee_tier_to_bps(fee_tier)
     }
 
     /// Return the pool address for `(token_a, token_b)`, or `None` if it does
@@ -1325,3 +1386,4 @@ mod tests {
         assert_eq!(factory.all_pools().len(), 2);
     }
 }
+
