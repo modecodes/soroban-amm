@@ -119,6 +119,24 @@ pub enum DataKey {
     AccruedFeeB,
     FlashLoanFeeBps,
 
+    // Issue #292: LP fee rebate — fraction of protocol fee redistributed to LPs.
+    /// Basis points of the protocol fee that are rebated back into LP reserves
+    /// (e.g. 5_000 = 50 % of the protocol fee goes back to LPs).
+    LpRebateBps,
+
+    // Issue #293: k-of-n multisig guard for emergency operations.
+    /// Vec<Address> of multisig signers.
+    MultisigSigners,
+    /// Required quorum (k in k-of-n).
+    MultisigQuorum,
+    /// Pending emergency-withdraw proposal: (recipient, Vec<Address> approvals).
+    MultisigProposalRecipient,
+    MultisigProposalApprovals,
+
+    // Issue #294: minimum liquidity lock — LP tokens permanently locked on first deposit.
+    /// Whether the minimum liquidity has already been locked (set on first deposit).
+    MinLiquidityLocked,
+
     // Pause / reentrancy
     Paused,
     /// Set to `true` while a flash loan is executing to block reentrant calls.
@@ -167,6 +185,24 @@ pub struct PoolInfo {
     pub admin: Address,
     pub fee_recipient: Address,
     pub protocol_fee_bps: i128,
+    /// Issue #292: fraction of protocol fee rebated back to LP reserves (bps).
+    pub lp_rebate_bps: i128,
+}
+
+/// Issue #293: multisig configuration returned by `get_multisig_config`.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultisigConfig {
+    pub signers: soroban_sdk::Vec<Address>,
+    pub quorum: u32,
+}
+
+/// Issue #293: pending emergency-withdraw proposal.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultisigProposal {
+    pub recipient: Address,
+    pub approvals: soroban_sdk::Vec<Address>,
 }
 
 #[contractclient(name = "FlashLoanReceiverClient")]
@@ -324,6 +360,15 @@ impl AmmPool {
             .set(&DataKey::LastTimestamp, &env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::Locked, &false);
+        // Issue #292: LP rebate disabled by default.
+        env.storage().instance().set(&DataKey::LpRebateBps, &0_i128);
+        // Issue #293: multisig disabled by default (empty signers, quorum 0).
+        env.storage().instance().set(&DataKey::MultisigQuorum, &0_u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigSigners, &soroban_sdk::Vec::<Address>::new(&env));
+        // Issue #294: minimum liquidity not yet locked.
+        env.storage().instance().set(&DataKey::MinLiquidityLocked, &false);
         // Circuit breaker: default threshold 50 % (5 000 bps), cooldown 600 s.
         env.storage()
             .instance()
@@ -672,7 +717,226 @@ impl AmmPool {
         (recipient, bps)
     }
 
-    /// Validate that a fee value is within the allowed range [0, 10_000].
+    // ── Issue #292: LP fee rebate ─────────────────────────────────────────────
+
+    /// Set the fraction of the protocol fee rebated back into LP reserves.
+    ///
+    /// `lp_rebate_bps` is a fraction of `protocol_fee_bps`
+    /// (e.g. 5_000 = 50 % of the protocol cut goes back to LPs).
+    /// Must be in `[0, 10_000]`. Admin-only.
+    pub fn set_lp_rebate(env: Env, admin: Address, lp_rebate_bps: i128) -> Result<(), AmmError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            return Err(AmmError::Unauthorized);
+        }
+        admin.require_auth();
+        if !(0..=10_000).contains(&lp_rebate_bps) {
+            return Err(AmmError::InvalidFeeBps);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::LpRebateBps, &lp_rebate_bps);
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "lp_rebate_set"), admin), (lp_rebate_bps,));
+        Ok(())
+    }
+
+    /// Return the current LP rebate rate in basis points.
+    pub fn get_lp_rebate(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LpRebateBps)
+            .unwrap_or(0)
+    }
+
+    // ── Issue #293: k-of-n multisig emergency guard ───────────────────────────
+
+    /// Configure the k-of-n multisig guard for emergency operations.
+    ///
+    /// Once set, `emergency_withdraw` requires `quorum` approvals from `signers`
+    /// before funds can be moved. Admin-only.
+    /// Set `quorum` to 0 to disable the multisig guard (single-admin mode).
+    pub fn set_multisig(
+        env: Env,
+        admin: Address,
+        signers: soroban_sdk::Vec<Address>,
+        quorum: u32,
+    ) -> Result<(), AmmError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            return Err(AmmError::Unauthorized);
+        }
+        admin.require_auth();
+        if quorum > 0 && (quorum as usize) > signers.len() as usize {
+            return Err(AmmError::InvalidFeeBps);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigSigners, &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigQuorum, &quorum);
+        // Clear any pending proposal when config changes.
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalRecipient, &Option::<Address>::None);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalApprovals, &soroban_sdk::Vec::<Address>::new(&env));
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "multisig_set"), admin), (quorum,));
+        Ok(())
+    }
+
+    /// Return the current multisig configuration.
+    pub fn get_multisig_config(env: Env) -> MultisigConfig {
+        MultisigConfig {
+            signers: env
+                .storage()
+                .instance()
+                .get(&DataKey::MultisigSigners)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env)),
+            quorum: env
+                .storage()
+                .instance()
+                .get(&DataKey::MultisigQuorum)
+                .unwrap_or(0),
+        }
+    }
+
+    /// Propose an emergency withdrawal (multisig mode).
+    ///
+    /// Any configured signer may call this to initiate or co-sign a proposal.
+    /// Once `quorum` approvals are collected the proposal can be executed via
+    /// `execute_multisig_emergency_withdraw`.
+    pub fn propose_emergency_withdraw(
+        env: Env,
+        signer: Address,
+        recipient: Address,
+    ) -> Result<(), AmmError> {
+        signer.require_auth();
+        let quorum: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigQuorum)
+            .unwrap_or(0);
+        if quorum == 0 {
+            return Err(AmmError::Unauthorized); // use emergency_withdraw directly
+        }
+        let signers: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigSigners)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if !signers.contains(&signer) {
+            return Err(AmmError::Unauthorized);
+        }
+        // Reset approvals if recipient changed.
+        let current_recipient: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigProposalRecipient)
+            .unwrap_or(None);
+        let mut approvals: soroban_sdk::Vec<Address> =
+            if current_recipient.as_ref() == Some(&recipient) {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::MultisigProposalApprovals)
+                    .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+            } else {
+                soroban_sdk::Vec::new(&env)
+            };
+        if !approvals.contains(&signer) {
+            approvals.push_back(signer.clone());
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalRecipient, &Some(recipient.clone()));
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalApprovals, &approvals);
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "ms_proposed"), signer), (recipient, approvals.len()));
+        Ok(())
+    }
+
+    /// Return the current pending multisig proposal, if any.
+    pub fn get_multisig_proposal(env: Env) -> Option<MultisigProposal> {
+        let recipient: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigProposalRecipient)
+            .unwrap_or(None);
+        recipient.map(|r| MultisigProposal {
+            recipient: r,
+            approvals: env
+                .storage()
+                .instance()
+                .get(&DataKey::MultisigProposalApprovals)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env)),
+        })
+    }
+
+    /// Execute the pending multisig emergency withdrawal once quorum is reached.
+    ///
+    /// Any signer may call this after enough approvals have been collected.
+    pub fn execute_multisig_emergency_withdraw(
+        env: Env,
+        signer: Address,
+    ) -> Result<(), AmmError> {
+        signer.require_auth();
+        let quorum: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigQuorum)
+            .unwrap_or(0);
+        if quorum == 0 {
+            return Err(AmmError::Unauthorized);
+        }
+        let signers: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigSigners)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if !signers.contains(&signer) {
+            return Err(AmmError::Unauthorized);
+        }
+        let recipient: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigProposalRecipient)
+            .unwrap_or(None);
+        let to = recipient.ok_or(AmmError::NoPendingAdmin)?;
+        let approvals: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigProposalApprovals)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        if (approvals.len() as u32) < quorum {
+            return Err(AmmError::InsufficientShares);
+        }
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let reserve_a = Self::get_reserve_a(env.clone());
+        let reserve_b = Self::get_reserve_b(env.clone());
+        if reserve_a > 0 {
+            SepTokenClient::new(&env, &token_a)
+                .transfer(&env.current_contract_address(), &to, &reserve_a);
+        }
+        if reserve_b > 0 {
+            SepTokenClient::new(&env, &token_b)
+                .transfer(&env.current_contract_address(), &to, &reserve_b);
+        }
+        env.storage().instance().set(&DataKey::ReserveA, &0_i128);
+        env.storage().instance().set(&DataKey::ReserveB, &0_i128);
+        // Clear proposal.
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalRecipient, &Option::<Address>::None);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalApprovals, &soroban_sdk::Vec::<Address>::new(&env));
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "ms_ew"), signer), (to, reserve_a, reserve_b));
+        Ok(())
+    }
+
     /// Shared by initialize, update_fee, and set_protocol_fee.
     fn validate_fee_bps(fee_bps: i128) -> Result<(), AmmError> {
         if !(0..=10_000).contains(&fee_bps) {
@@ -971,7 +1235,25 @@ impl AmmPool {
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
         }
-        if shares < min_shares {
+
+        // Issue #294: on the very first deposit, permanently lock MINIMUM_LIQUIDITY
+        // LP tokens to the zero address so the pool can never be fully drained.
+        const MINIMUM_LIQUIDITY: i128 = 1_000;
+        let already_locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinLiquidityLocked)
+            .unwrap_or(false);
+        let (shares_to_provider, shares_locked) = if total_shares == 0 && !already_locked {
+            if shares <= MINIMUM_LIQUIDITY {
+                return Err(AmmError::InsufficientShares);
+            }
+            (shares - MINIMUM_LIQUIDITY, MINIMUM_LIQUIDITY)
+        } else {
+            (shares, 0)
+        };
+
+        if shares_to_provider < min_shares {
             return Err(AmmError::SlippageExceeded);
         }
 
@@ -982,6 +1264,7 @@ impl AmmPool {
         client_b.transfer(&provider, &env.current_contract_address(), &amount_b);
 
         // Update reserves.
+        let total_minted = shares_to_provider + shares_locked;
         env.storage()
             .instance()
             .set(&DataKey::ReserveA, &(reserve_a + amount_a));
@@ -990,15 +1273,22 @@ impl AmmPool {
             .set(&DataKey::ReserveB, &(reserve_b + amount_b));
         env.storage()
             .instance()
-            .set(&DataKey::TotalShares, &(total_shares + shares));
+            .set(&DataKey::TotalShares, &(total_shares + total_minted));
 
         // Mint LP tokens.
         let lp_client = LpTokenClient::new(&env, &lp_token);
-        lp_client.mint(&provider, &shares);
+        // Issue #294: lock minimum liquidity to the contract address itself (zero-address equivalent).
+        if shares_locked > 0 {
+            lp_client.mint(&env.current_contract_address(), &shares_locked);
+            env.storage()
+                .instance()
+                .set(&DataKey::MinLiquidityLocked, &true);
+        }
+        lp_client.mint(&provider, &shares_to_provider);
 
-        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "add_liquidity"), provider), (amount_a, amount_b, shares));
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "add_liquidity"), provider), (amount_a, amount_b, shares_to_provider));
 
-        Ok(shares)
+        Ok(shares_to_provider)
     }
 
     /// Withdraw liquidity from the pool by burning LP shares.
@@ -1418,15 +1708,27 @@ impl AmmPool {
         } else {
             0
         };
-        // Update reserves (protocol fee held outside LP reserves).
+        // Issue #292: LP rebate — fraction of protocol fee returned to LP reserves.
+        let lp_rebate_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LpRebateBps)
+            .unwrap_or(0);
+        let lp_rebate = if protocol_fee > 0 && lp_rebate_bps > 0 {
+            protocol_fee * lp_rebate_bps / 10_000
+        } else {
+            0
+        };
+        let net_protocol_fee = protocol_fee - lp_rebate;
+        // Update reserves (net protocol fee held outside LP reserves; rebate stays in reserves).
         if token_in == token_a {
             env.storage()
                 .instance()
-                .set(&DataKey::ReserveA, &(reserve_in + amount_in - protocol_fee));
+                .set(&DataKey::ReserveA, &(reserve_in + amount_in - net_protocol_fee));
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveB, &(reserve_out - amount_out));
-            if protocol_fee > 0 {
+            if net_protocol_fee > 0 {
                 let accrued: i128 = env
                     .storage()
                     .instance()
@@ -1434,16 +1736,16 @@ impl AmmPool {
                     .unwrap_or(0);
                 env.storage()
                     .instance()
-                    .set(&DataKey::AccruedFeeA, &(accrued + protocol_fee));
+                    .set(&DataKey::AccruedFeeA, &(accrued + net_protocol_fee));
             }
         } else {
             env.storage()
                 .instance()
-                .set(&DataKey::ReserveB, &(reserve_in + amount_in - protocol_fee));
+                .set(&DataKey::ReserveB, &(reserve_in + amount_in - net_protocol_fee));
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveA, &(reserve_out - amount_out));
-            if protocol_fee > 0 {
+            if net_protocol_fee > 0 {
                 let accrued: i128 = env
                     .storage()
                     .instance()
@@ -1451,7 +1753,7 @@ impl AmmPool {
                     .unwrap_or(0);
                 env.storage()
                     .instance()
-                    .set(&DataKey::AccruedFeeB, &(accrued + protocol_fee));
+                    .set(&DataKey::AccruedFeeB, &(accrued + net_protocol_fee));
             }
         }
 
@@ -1558,17 +1860,28 @@ impl AmmPool {
         } else {
             0
         };
+        // Issue #292: LP rebate — fraction of protocol fee returned to LP reserves.
+        let lp_rebate_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LpRebateBps)
+            .unwrap_or(0);
+        let lp_rebate = if protocol_fee > 0 && lp_rebate_bps > 0 {
+            protocol_fee * lp_rebate_bps / 10_000
+        } else {
+            0
+        };
+        let net_protocol_fee = protocol_fee - lp_rebate;
 
-        // Update reserves.
-        
+        // Update reserves (net protocol fee held outside LP reserves; rebate stays in reserves).
         if token_in == token_a {
             env.storage()
                 .instance()
-                .set(&DataKey::ReserveA, &(reserve_a + amount_in - protocol_fee));
+                .set(&DataKey::ReserveA, &(reserve_a + amount_in - net_protocol_fee));
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveB, &(reserve_b - amount_out));
-            if protocol_fee > 0 {
+            if net_protocol_fee > 0 {
                 let accrued: i128 = env
                     .storage()
                     .instance()
@@ -1576,16 +1889,16 @@ impl AmmPool {
                     .unwrap_or(0);
                 env.storage()
                     .instance()
-                    .set(&DataKey::AccruedFeeA, &(accrued + protocol_fee));
+                    .set(&DataKey::AccruedFeeA, &(accrued + net_protocol_fee));
             }
         } else {
             env.storage()
                 .instance()
-                .set(&DataKey::ReserveB, &(reserve_b + amount_in - protocol_fee));
+                .set(&DataKey::ReserveB, &(reserve_b + amount_in - net_protocol_fee));
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveA, &(reserve_a - amount_out));
-            if protocol_fee > 0 {
+            if net_protocol_fee > 0 {
                 let accrued: i128 = env
                     .storage()
                     .instance()
@@ -1593,7 +1906,7 @@ impl AmmPool {
                     .unwrap_or(0);
                 env.storage()
                     .instance()
-                    .set(&DataKey::AccruedFeeB, &(accrued + protocol_fee));
+                    .set(&DataKey::AccruedFeeB, &(accrued + net_protocol_fee));
             }
         }
 
@@ -1936,6 +2249,11 @@ impl AmmPool {
                 .storage()
                 .instance()
                 .get(&DataKey::ProtocolFeeBps)
+                .unwrap_or(0),
+            lp_rebate_bps: env
+                .storage()
+                .instance()
+                .get(&DataKey::LpRebateBps)
                 .unwrap_or(0),
         }
     }

@@ -62,6 +62,8 @@ pub struct PoolInfo {
     pub admin: Address,
     pub fee_recipient: Address,
     pub protocol_fee_bps: i128,
+    /// Issue #292: fraction of protocol fee rebated back to LP reserves (bps).
+    pub lp_rebate_bps: i128,
 }
 
 // ── Quote types ───────────────────────────────────────────────────────────────
