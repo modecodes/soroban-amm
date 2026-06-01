@@ -574,8 +574,6 @@ impl AmmPool {
 
         Ok(())
     }
-        Ok(())
-    }
 
     /// Update the protocol fee configuration. Admin-only.
     ///
@@ -2448,7 +2446,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_price_ratio() {
+    fn test_price_ratio(, &None) {
         let (env, admin, amm_addr, lp_addr, _) = setup();
 
         let (ta_client, ta_sac) = create_sac(&env, &admin);
@@ -2601,7 +2599,7 @@ pub(crate) mod tests {
         let out = amm.swap(&trader, &ts.tb_addr, &100_000_i128, &0_i128, &u64::MAX);
         assert!(out > 0 && out < 100_000);
 
-        let info = amm.get_info();
+        let info = amm.get_info(, &None);
         assert_eq!(info.reserve_b, 1_100_000);
         assert_eq!(info.reserve_a, 1_000_000 - out);
     }
@@ -2661,7 +2659,7 @@ pub(crate) mod tests {
         ta_sac.mint(&trader, &amount_in);
         let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
 
-        let info = amm.get_info();
+        let info = amm.get_info(, &None);
         assert_eq!(info.reserve_a, 1_000_000 + amount_in);
         assert_eq!(info.reserve_b, 1_000_000 - out);
         // k must grow because fee stays in pool
@@ -2812,7 +2810,7 @@ pub(crate) mod tests {
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &quoted_in);
-        let actual_in = amm.swap_exact_out(&trader, &ts.tb_addr, &want_out, &quoted_in, &u64::MAX);
+        let actual_in = amm.swap_exact_out(&trader, &ts.tb_addr, &want_out, &quoted_in, &u64::MAX, &None);
 
         assert_eq!(actual_in, quoted_in);
     }
@@ -2906,12 +2904,12 @@ pub(crate) mod tests {
         let lp1 = Address::generate(env);
         ta_sac.mint(&lp1, &1_000_000_i128);
         tb_sac.mint(&lp1, &1_000_000_i128);
-        let shares1 = amm.add_liquidity(&lp1, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+        let shares1 = amm.add_liquidity(&lp1, &1_000_000_i128, &1_000_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         let lp2 = Address::generate(env);
         ta_sac.mint(&lp2, &500_000_i128);
         tb_sac.mint(&lp2, &500_000_i128);
-        let shares2 = amm.add_liquidity(&lp2, &500_000_i128, &500_000_i128, &0_i128, &u64::MAX);
+        let shares2 = amm.add_liquidity(&lp2, &500_000_i128, &500_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         assert_eq!(amm.get_info().total_shares, shares1 + shares2);
 
@@ -2946,7 +2944,7 @@ pub(crate) mod tests {
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &amount_in);
-        let actual = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
+        let actual = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX, &None);
 
         assert_eq!(quoted, actual);
     }
@@ -2964,7 +2962,7 @@ pub(crate) mod tests {
         let initial_amt = 1_000_000_i128;
         ta_sac.mint(&provider, &initial_amt);
         tb_sac.mint(&provider, &initial_amt);
-        amm.add_liquidity(&provider, &initial_amt, &initial_amt, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &initial_amt, &initial_amt, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         let info = amm.get_info();
         let initial_k = info.reserve_a * info.reserve_b;
@@ -2978,14 +2976,14 @@ pub(crate) mod tests {
             if i % 2 == 0 {
                 // A -> B
                 ta_sac.mint(&trader, &swap_amt);
-                amm.swap(&trader, &ts.ta_addr, &swap_amt, &0_i128, &u64::MAX);
+                amm.swap(&trader, &ts.ta_addr, &swap_amt, &0_i128, &u64::MAX, &None);
             } else {
                 // B -> A
                 tb_sac.mint(&trader, &swap_amt);
                 amm.swap(&trader, &ts.tb_addr, &swap_amt, &0_i128, &u64::MAX);
             }
 
-            let new_info = amm.get_info();
+            let new_info = amm.get_info(, &None);
             let new_k = new_info.reserve_a * new_info.reserve_b;
 
             // Invariant must hold: new_k >= initial_k
@@ -3114,7 +3112,7 @@ pub(crate) mod tests {
         let swap_event = events
             .iter()
             .find(|e| {
-                e.0 == amm.address && e.1 == (symbol_short!("swap"), trader.clone()).into_val(env)
+                e.0 == amm.address && e.1 == (symbol_short!("swap", &None), trader.clone()).into_val(env)
             })
             .expect("swap event not found");
 
@@ -3164,7 +3162,7 @@ pub(crate) mod tests {
         ta_sac.mint(&trader, &100_000_i128);
         amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128, &u64::MAX);
 
-        // Accumulators should have updated: price (1_000_000) * 10 seconds = 10_000_000
+        // Accumulators should have updated: price (1_000_000, &None) * 10 seconds = 10_000_000
         let (new_cum_a, new_cum_b, new_ts) = amm.get_price_cumulative();
         assert_eq!(new_ts, last_ts + 10);
         assert_eq!(new_cum_a, 10_000_000);
@@ -3182,7 +3180,7 @@ pub(crate) mod tests {
 
         // Perform another swap
         tb_sac.mint(&trader, &50_000_i128);
-        amm.swap(&trader, &ts.tb_addr, &50_000_i128, &0_i128, &u64::MAX);
+        amm.swap(&trader, &ts.tb_addr, &50_000_i128, &0_i128, &u64::MAX, &None);
 
         let (final_cum_a, final_cum_b, final_ts) = amm.get_price_cumulative();
         assert_eq!(final_ts, new_ts + 5);
@@ -3219,7 +3217,7 @@ pub(crate) mod tests {
         env.ledger().set_timestamp(last_ts + 10);
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &10_000_i128);
-        amm.swap(&trader, &ts.ta_addr, &10_000_i128, &0_i128, &u64::MAX);
+        amm.swap(&trader, &ts.ta_addr, &10_000_i128, &0_i128, &u64::MAX, &None);
 
         let (new_cum, new_ts) = amm.get_liquidity_cumulative();
         assert_eq!(new_ts, last_ts + 10);
@@ -3268,7 +3266,7 @@ pub(crate) mod tests {
         ta_sac.mint(&trader, &amount_in);
         let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
         // fee_bps=0 → no discount; pure constant-product formula
-        let expected = amount_in * 1_000_000 / (1_000_000 + amount_in);
+        let expected = amount_in * 1_000_000 / (1_000_000 + amount_in, &None);
         assert_eq!(out, expected);
     }
 
@@ -3373,7 +3371,7 @@ pub(crate) mod tests {
         ta_sac.mint(&lp2, &500_000_i128);
         tb_sac.mint(&lp2, &1_500_000_i128);
         let shares_minted =
-            amm.add_liquidity(&lp2, &500_000_i128, &1_500_000_i128, &0_i128, &u64::MAX);
+            amm.add_liquidity(&lp2, &500_000_i128, &1_500_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         let shares_from_a = 500_000_i128 * initial_shares / 1_000_000;
         let shares_from_b = 1_500_000_i128 * initial_shares / 2_000_000;
@@ -3492,7 +3490,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        let shares = amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
+        let shares = amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         assert_eq!(shares, large_amount);
         let info = amm.get_info();
@@ -3512,7 +3510,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         // amount_in=10^9; numerator = 10^9*9970*4e18 ~ 4e31 < i128::MAX
         let trader = Address::generate(env);
@@ -3524,7 +3522,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_large_reserves_price_ratio_no_overflow() {
-        let ts = setup_pool(30);
+        let ts = setup_pool(30, &None);
         let env = &ts.env;
         let amm = AmmPoolClient::new(env, &ts.amm_addr);
         let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
@@ -3534,7 +3532,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         // price_ratio: reserve_b * 1_000_000 / reserve_a; 4e18 * 1e6 = 4e24 < i128::MAX
         let (price_a, price_b) = amm.price_ratio();
@@ -3554,7 +3552,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         // Forward: B for A
         let amount_in = 1_000_000_000_i128;
@@ -3586,7 +3584,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         // 4e18 * 1e17 * 10000 = 4e39 > i128::MAX
         amm.get_amount_in(&ts.ta_addr, &100_000_000_000_000_000_i128);
@@ -3607,7 +3605,7 @@ pub(crate) mod tests {
         let lp1 = Address::generate(env);
         ta_sac.mint(&lp1, &2_000_000_i128);
         tb_sac.mint(&lp1, &2_000_000_i128);
-        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &u64::MAX);
+        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -3659,7 +3657,7 @@ pub(crate) mod tests {
         let lp1 = Address::generate(env);
         ta_sac.mint(&lp1, &2_000_000_i128);
         tb_sac.mint(&lp1, &2_000_000_i128);
-        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &u64::MAX);
+        amm.add_liquidity(&lp1, &2_000_000_i128, &2_000_000_i128, &0_i128, &0_i128, &0_i128, &u64::MAX);
 
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -4462,17 +4460,18 @@ mod prop_tests {
             &1_000_000_i128,
             &1_000_000_i128,
             &0_i128,
+            &0_i128,
+            &0_i128,
             &u64::MAX,
-        )
-        .unwrap();
+        );
 
         // --- Tiny swap: price_impact_bps should be 0 (rounds to 0 at 1 unit). ---
-        let tiny = amm.simulate_swap(&ts.ta_addr, &1_i128).unwrap();
+        let tiny = amm.simulate_swap(&ts.ta_addr, &1_i128);
         // spot and effective price differ by sub-bps amounts for 1-unit swap.
         assert_eq!(tiny.price_impact_bps, 0);
 
         // --- Large swap: price_impact_bps must be positive. ---
-        let large = amm.simulate_swap(&ts.ta_addr, &100_000_i128).unwrap();
+        let large = amm.simulate_swap(&ts.ta_addr, &100_000_i128);
         // With reserves 1_000_000 / 1_000_000 and amount_in 100_000 (10 % of pool):
         //   spot_price  = 1_000_000 * 1_000_000 / 1_000_000 = 1_000_000
         //   amount_in_with_fee = 100_000 * (10000 - 30) = 997_000_000
@@ -4481,7 +4480,7 @@ mod prop_tests {
         assert!(large.price_impact_bps > 0, "price_impact_bps must be positive for large swap");
 
         // Larger swap must have higher price impact than smaller swap.
-        let medium = amm.simulate_swap(&ts.ta_addr, &10_000_i128).unwrap();
+        let medium = amm.simulate_swap(&ts.ta_addr, &10_000_i128);
         assert!(
             large.price_impact_bps > medium.price_impact_bps,
             "larger swap must have larger price impact"
