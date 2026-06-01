@@ -395,7 +395,7 @@ impl Governance {
             ProposalKind::TransferAdmin(_new_admin) => {}
             ProposalKind::PausePool => {}
             ProposalKind::UnpausePool => {}
-            ProposalKind::EmergencyWithdraw(_to) => {}
+            ProposalKind::EmergencyWithdraw(_) => {}
         }
 
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();

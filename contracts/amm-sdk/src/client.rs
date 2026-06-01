@@ -397,13 +397,8 @@ impl<'a> AmmPoolSdk<'a> {
         min_b: i128,
         deadline: u64,
     ) -> Result<(i128, i128), SdkAmmError> {
-        Ok(self.client.remove_liquidity(
-            provider,
-            &shares,
-            &min_a,
-            &min_b,
-            &deadline,
-        ))
+        Ok(self.client
+            .remove_liquidity(provider, &shares, &min_a, &min_b, &deadline))
     }
 
     /// Issue a flash loan.
@@ -414,7 +409,8 @@ impl<'a> AmmPoolSdk<'a> {
         amount: i128,
         data: Bytes,
     ) -> Result<i128, SdkAmmError> {
-        Ok(self.client.flash_loan(receiver, token, &amount, &data))
+        Ok(self.client
+            .flash_loan(receiver, token, &amount, &data))
     }
 }
 

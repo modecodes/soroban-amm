@@ -99,7 +99,7 @@ impl IncentiveCampaigns {
         let id: u64 = env.storage().instance().get(&DataKey::NextCampaignId).unwrap();
         let campaign = Campaign {
             id,
-            pool,
+            pool: pool.clone(),
             lp_token: lp_token.clone(),
             reward_token: reward_token.clone(),
             start_time,
@@ -200,7 +200,7 @@ impl IncentiveCampaigns {
             .persistent()
             .set(&debt_key, &provider_share);
 
-        let mut updated = campaign;
+        let mut updated = campaign.clone();
         updated.total_distributed += pending;
         env.storage()
             .persistent()
