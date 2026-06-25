@@ -213,7 +213,7 @@ impl ClPositionNft {
     }
 
     /// Returns the [`PositionMeta`] for `token_id`, or [`NftError::TokenNotFound`].
-    pub fn get_position(env: Env, token_id: u64) -> Result<PositionMeta, NftError> {
+    pub fn position_meta(env: Env, token_id: u64) -> Result<PositionMeta, NftError> {
         env.storage()
             .persistent()
             .get(&DataKey::TokenPosition(token_id))
@@ -226,6 +226,16 @@ impl ClPositionNft {
             .persistent()
             .get(&DataKey::OwnedTokens(owner))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the number of tokens owned by `owner`.
+    pub fn balance_of(env: Env, owner: Address) -> u32 {
+        Self::tokens_of(env, owner).len()
+    }
+
+    /// Returns the total number of tokens ever minted.
+    pub fn total_supply(env: Env) -> u64 {
+        Self::next_token_id(env)
     }
 
     /// Approve `approved` to transfer `token_id`. Only callable by the owner.
@@ -330,7 +340,7 @@ mod tests {
         assert_eq!(client.owner_of(&id0), user);
         assert_eq!(client.owner_of(&id1), user);
 
-        let meta0 = client.get_position(&id0);
+        let meta0 = client.position_meta(&id0);
         assert_eq!(meta0.lower_tick, -100);
         assert_eq!(meta0.upper_tick, 100);
 
@@ -347,7 +357,7 @@ mod tests {
     fn mint_stores_correct_position_meta() {
         let (_, client, _admin, pool, user) = setup();
         let id = client.mint(&user, &pool, &-500, &500);
-        let meta = client.get_position(&id);
+        let meta = client.position_meta(&id);
         assert_eq!(meta.pool, pool);
         assert_eq!(meta.lower_tick, -500);
         assert_eq!(meta.upper_tick, 500);
@@ -368,7 +378,7 @@ mod tests {
         client.burn(&id);
 
         assert!(client.try_owner_of(&id).is_err());
-        assert!(client.try_get_position(&id).is_err());
+        assert!(client.try_position_meta(&id).is_err());
         assert_eq!(client.get_approved(&id), None);
         assert_eq!(client.tokens_of(&user).len(), 0);
     }
@@ -462,5 +472,33 @@ mod tests {
 
         assert_eq!(b_owned.len(), 1);
         assert!(b_owned.iter().any(|id| id == id1));
+    }
+
+    #[test]
+    fn balance_of_tracks_mint_and_burn() {
+        let (env, client, _admin, pool, user) = setup();
+        assert_eq!(client.balance_of(&user), 0);
+
+        let id = client.mint(&user, &pool, &-100, &100);
+        assert_eq!(client.balance_of(&user), 1);
+
+        client.burn(&id);
+        assert_eq!(client.balance_of(&user), 0);
+    }
+
+    #[test]
+    fn total_supply_tracks_all_mints() {
+        let (env, client, _admin, pool, user) = setup();
+        assert_eq!(client.total_supply(), 0);
+
+        let id0 = client.mint(&user, &pool, &-100, &100);
+        assert_eq!(client.total_supply(), 1);
+
+        let id1 = client.mint(&user, &pool, &-200, &200);
+        assert_eq!(client.total_supply(), 2);
+
+        client.burn(&id0);
+        // Burning does not decrease total_supply
+        assert_eq!(client.total_supply(), 2);
     }
 }
