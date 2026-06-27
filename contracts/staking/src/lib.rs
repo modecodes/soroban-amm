@@ -68,6 +68,8 @@ pub enum DataKey {
     ConfigMinLockDuration,
     /// Configurable max lock duration in seconds.
     ConfigMaxLockDuration,
+    /// Emergency mode flag; when true stakers may reclaim LP without rewards (#359).
+    EmergencyMode,
 }
 
 // ── Data structures ───────────────────────────────────────────────────────
@@ -462,6 +464,94 @@ impl Staking {
 
         env.events().publish((Symbol::new(&env, "unstaked"),), (staker, amount, rewards));
         (amount, rewards)
+    }
+
+    /// Enable or disable emergency mode (#359). Admin only.
+    ///
+    /// Emergency mode unlocks [`Self::emergency_withdraw`] so stakers can
+    /// reclaim their LP tokens without touching the reward token. It is gated
+    /// behind the admin so it cannot be used to skip rewards under normal
+    /// conditions.
+    pub fn set_emergency_mode(env: Env, admin: Address, enabled: bool) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(admin == stored_admin, "not admin");
+        env.storage().instance().set(&DataKey::EmergencyMode, &enabled);
+        env.events()
+            .publish((Symbol::new(&env, "emergency_mode"),), (admin, enabled));
+    }
+
+    /// Whether emergency mode is currently active (#359).
+    pub fn is_emergency_mode(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyMode)
+            .unwrap_or(false)
+    }
+
+    /// Reclaim staked LP tokens without claiming rewards (#359).
+    ///
+    /// Only callable while the admin has enabled emergency mode. Unlike
+    /// [`Self::unstake`], this never interacts with the reward token, so
+    /// stakers can always recover their LP even if the reward token is paused,
+    /// blacklisted, or the reward pool has been drained by a bug. Any pending
+    /// rewards are forfeited, and the lock (if any) is ignored.
+    ///
+    /// Returns the raw LP amount returned to the staker.
+    pub fn emergency_withdraw(env: Env, staker: Address) -> i128 {
+        staker.require_auth();
+        assert!(
+            Self::is_emergency_mode(env.clone()),
+            "emergency mode not active"
+        );
+
+        let staked_amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakerAmount(staker.clone()))
+            .unwrap_or(0);
+        assert!(staked_amount > 0, "nothing staked");
+
+        // Remove this staker's effective contribution from the global total.
+        let boost: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BoostMultiplier(staker.clone()))
+            .unwrap_or(MIN_BOOST);
+        let effective = Self::_effective_amount(staked_amount, boost);
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalEffectiveStaked)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalEffectiveStaked, &(total - effective).max(0));
+
+        // Zero out the staker's position, debt, boost, and lock.
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakerAmount(staker.clone()), &0i128);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakerRewardsDebt(staker.clone()), &0i128);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BoostMultiplier(staker.clone()), &MIN_BOOST);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LockExpiry(staker.clone()), &0u64);
+
+        // Return the raw LP balance without touching the reward token.
+        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        let pool_addr = env.current_contract_address();
+        SepTokenClient::new(&env, &lp_token).transfer(&pool_addr, &staker, &staked_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "emergency_withdraw"),),
+            (staker, staked_amount),
+        );
+        staked_amount
     }
 
     /// View pending rewards for a staker.
@@ -874,5 +964,78 @@ mod tests {
         let claimed = staking.claim(&staker);
         assert_eq!(claimed, 100);
         assert_eq!(staking.pending_rewards(&staker), 0);
+    }
+
+    #[test]
+    fn test_emergency_withdraw_disabled_by_default_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, staker, staking) = setup(&env);
+
+        staking.stake(&staker, &1_000_i128);
+
+        // Emergency mode is off by default — withdrawal must be rejected.
+        assert!(!staking.is_emergency_mode());
+        let result = staking.try_emergency_withdraw(&staker);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_emergency_withdraw_returns_lp_without_rewards() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        let lp_token = staking.get_pool_info().lp_token;
+        let reward_token = staking.get_pool_info().reward_token;
+        let lp_client = StellarTokenClient::new(&env, &lp_token);
+        let reward_client = StellarTokenClient::new(&env, &reward_token);
+
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &100_i128);
+        assert_eq!(staking.pending_rewards(&staker), 100);
+
+        let reward_balance_before = reward_client.balance(&staker);
+
+        staking.set_emergency_mode(&admin, &true);
+        let returned = staking.emergency_withdraw(&staker);
+
+        // Full LP returned, no reward token moved.
+        assert_eq!(returned, 1_000);
+        assert_eq!(lp_client.balance(&staker), 5_000); // original mint restored
+        assert_eq!(reward_client.balance(&staker), reward_balance_before);
+
+        // Position fully cleared.
+        let info = staking.get_staker_info(&staker);
+        assert_eq!(info.staked_amount, 0);
+        assert_eq!(info.effective_amount, 0);
+        assert_eq!(staking.pending_rewards(&staker), 0);
+        assert_eq!(staking.get_pool_info().total_effective_staked, 0);
+    }
+
+    #[test]
+    fn test_emergency_withdraw_ignores_active_lock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        // Lock for the max duration — unstake would panic before expiry.
+        staking.stake_locked(&staker, &1_000_i128, &MAX_LOCK_DURATION);
+        assert!(staking.try_unstake(&staker, &1_000_i128).is_err());
+
+        staking.set_emergency_mode(&admin, &true);
+        let returned = staking.emergency_withdraw(&staker);
+        assert_eq!(returned, 1_000);
+    }
+
+    #[test]
+    fn test_set_emergency_mode_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, staker, staking) = setup(&env);
+
+        // A non-admin caller must not be able to toggle emergency mode.
+        let result = staking.try_set_emergency_mode(&staker, &true);
+        assert!(result.is_err());
     }
 }
