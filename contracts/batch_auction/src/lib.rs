@@ -16,6 +16,7 @@
 #![no_std]
 
 use amm::AmmPoolClient;
+use concentrated_liquidity::ConcentratedLiquidityClient;
 use soroban_sdk::token::Client as SepTokenClient;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
@@ -44,6 +45,20 @@ pub enum AuctionError {
 
 // ── Storage types ─────────────────────────────────────────────────────────────
 
+/// Settlement venue an order may be routed to (issue #351).
+///
+/// `Amm` dispatches through [`AmmPoolClient`] (constant-product pool); `Cl`
+/// dispatches through [`ConcentratedLiquidityClient`] (Uniswap-v3-style
+/// concentrated-liquidity pool). Both venues escrow the input from, and pay the
+/// output to, the batch-auction contract, so they are interchangeable from a
+/// trader's perspective.
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolType {
+    Amm,
+    Cl,
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Order {
@@ -55,6 +70,18 @@ pub struct Order {
     pub amount_in: i128,
     pub min_out: i128,
     pub submitted_at: u64,
+    /// Venue type of `pool`.
+    pub pool_type: PoolType,
+    /// Swap direction for concentrated-liquidity venues: `true` swaps token A
+    /// for token B (price decreasing). Unused for `PoolType::Amm`.
+    pub zero_for_one: bool,
+    /// `sqrtPriceX96` limit for concentrated-liquidity venues. `0` means the
+    /// pool's own default bound is used. Unused for `PoolType::Amm`.
+    pub sqrt_price_limit: u128,
+    /// Optional alternate venue of the *opposite* `PoolType`, trading the same
+    /// `token_in → token_out` pair. When present, settlement quotes both venues
+    /// and routes the swap to whichever returns more output (issue #351).
+    pub alt_pool: Option<Address>,
 }
 
 #[contracttype]
@@ -112,7 +139,8 @@ impl BatchAuction {
         Ok(())
     }
 
-    /// Submit a swap order and escrow `amount_in` of `token_in`.
+    /// Submit a constant-product (AMM) swap order and escrow `amount_in` of
+    /// `token_in`.
     ///
     /// Tokens are pulled from `trader` immediately so the batch holds a firm
     /// commitment. `token_in`/`token_out` must be the pool's token pair; this
@@ -128,6 +156,82 @@ impl BatchAuction {
         amount_in: i128,
         min_out: i128,
         deadline: u64,
+    ) -> Result<u64, AuctionError> {
+        Self::record_order(
+            env,
+            trader,
+            pool,
+            token_in,
+            token_out,
+            amount_in,
+            min_out,
+            deadline,
+            PoolType::Amm,
+            false,
+            0,
+            None,
+        )
+    }
+
+    /// Submit a concentrated-liquidity (CL) swap order and escrow `amount_in`
+    /// of `token_in` (issue #351).
+    ///
+    /// `zero_for_one` selects the CL swap direction (token A → token B when
+    /// `true`) and `sqrt_price_limit` is the `sqrtPriceX96` bound passed to the
+    /// CL pool (`0` lets the pool walk to its own bound).
+    ///
+    /// `alt_amm_pool` may name a constant-product pool trading the same
+    /// `token_in → token_out` pair. When supplied, settlement quotes both the
+    /// CL pool and the AMM pool and routes the swap to whichever returns more
+    /// output, giving batched traders best execution across venue types.
+    ///
+    /// Returns the new order ID.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_order_cl(
+        env: Env,
+        trader: Address,
+        pool: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_out: i128,
+        zero_for_one: bool,
+        sqrt_price_limit: u128,
+        alt_amm_pool: Option<Address>,
+        deadline: u64,
+    ) -> Result<u64, AuctionError> {
+        Self::record_order(
+            env,
+            trader,
+            pool,
+            token_in,
+            token_out,
+            amount_in,
+            min_out,
+            deadline,
+            PoolType::Cl,
+            zero_for_one,
+            sqrt_price_limit,
+            alt_amm_pool,
+        )
+    }
+
+    /// Shared order-intake path: validate, escrow `amount_in`, persist the
+    /// order, and enqueue it into the current batch window.
+    #[allow(clippy::too_many_arguments)]
+    fn record_order(
+        env: Env,
+        trader: Address,
+        pool: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_out: i128,
+        deadline: u64,
+        pool_type: PoolType,
+        zero_for_one: bool,
+        sqrt_price_limit: u128,
+        alt_pool: Option<Address>,
     ) -> Result<u64, AuctionError> {
         if deadline < env.ledger().timestamp() {
             return Err(AuctionError::DeadlineExceeded);
@@ -181,6 +285,10 @@ impl BatchAuction {
             amount_in,
             min_out,
             submitted_at: env.ledger().timestamp(),
+            pool_type,
+            zero_for_one,
+            sqrt_price_limit,
+            alt_pool,
         };
 
         env.storage().instance().set(&DataKey::Order(id), &order);
@@ -302,17 +410,11 @@ impl BatchAuction {
                 .get(&DataKey::Order(order_id))
                 .unwrap();
 
-            // Execute the swap on behalf of the batch auction contract.
-            // Authorization for the token pull (auction → pool) is automatically
-            // satisfied because the batch_auction is the invoking contract.
-            let amount_out = AmmPoolClient::new(&env, &order.pool)
-                .swap(
-                    &auction_addr,
-                    &order.token_in,
-                    &order.amount_in,
-                    &order.min_out,
-                    &settlement_deadline,
-                );
+            // Execute the swap on behalf of the batch auction contract, routing
+            // to whichever supported venue gives the best output. Authorization
+            // for the token pull (auction → pool) is automatically satisfied
+            // because the batch_auction is the invoking contract.
+            let amount_out = Self::execute_op(&env, &order, &auction_addr, settlement_deadline);
 
             // Forward output tokens to the original trader.
             SepTokenClient::new(&env, &order.token_out).transfer(
@@ -341,6 +443,108 @@ impl BatchAuction {
             .publish((symbol_short!("settled"),), (process_count,));
 
         Ok(results)
+    }
+
+    /// Quote the output an order would receive on each candidate venue and
+    /// return the best `(amount_out, pool, pool_type)` triple (issue #351).
+    ///
+    /// Read-only: callers can preview the venue settlement would choose. The
+    /// quote walks the same pool math used at execution, so the chosen venue
+    /// matches `settle_batch`'s routing for an unchanged pool state.
+    pub fn quote_order(env: Env, order_id: u64) -> Result<(i128, Address, PoolType), AuctionError> {
+        let order: Order = env
+            .storage()
+            .instance()
+            .get(&DataKey::Order(order_id))
+            .ok_or(AuctionError::OrderNotFound)?;
+        Ok(Self::best_venue(&env, &order))
+    }
+
+    /// Dispatch a single order's swap to the best available venue and return
+    /// the realized output amount.
+    ///
+    /// Branches on [`PoolType`]: `Amm` settles through [`AmmPoolClient`], `Cl`
+    /// through [`ConcentratedLiquidityClient`]. When the chosen venue consumes
+    /// less than `amount_in` (a concentrated-liquidity pool can fill partially
+    /// once it exhausts in-range liquidity), the unspent escrow is refunded to
+    /// the trader so no funds are stranded in the auction contract.
+    fn execute_op(env: &Env, order: &Order, sender: &Address, deadline: u64) -> i128 {
+        let (_, venue, venue_type) = Self::best_venue(env, order);
+
+        let spent_before = SepTokenClient::new(env, &order.token_in).balance(sender);
+        let amount_out = match venue_type {
+            PoolType::Amm => AmmPoolClient::new(env, &venue).swap(
+                sender,
+                &order.token_in,
+                &order.amount_in,
+                &order.min_out,
+                &deadline,
+            ),
+            PoolType::Cl => ConcentratedLiquidityClient::new(env, &venue).swap(
+                sender,
+                &order.zero_for_one,
+                &order.amount_in,
+                &order.sqrt_price_limit,
+                &order.min_out,
+                &deadline,
+            ),
+        };
+        let spent_after = SepTokenClient::new(env, &order.token_in).balance(sender);
+
+        // Refund any input the venue did not consume (partial fill).
+        let spent = spent_before - spent_after;
+        let unspent = order.amount_in - spent;
+        if unspent > 0 {
+            SepTokenClient::new(env, &order.token_in).transfer(sender, &order.trader, &unspent);
+        }
+
+        amount_out
+    }
+
+    /// Pick the venue that quotes the most output for `order`.
+    ///
+    /// Always considers the primary `(pool, pool_type)`. If `alt_pool` is set it
+    /// is treated as a venue of the opposite type and compared; the higher quote
+    /// wins, with the primary kept on ties or when the alternate cannot be
+    /// quoted. Quotes are best-effort: a venue that fails to quote is simply not
+    /// selected, so a stale or unrelated alternate can never block settlement.
+    fn best_venue(env: &Env, order: &Order) -> (i128, Address, PoolType) {
+        let primary_q = Self::try_quote(env, &order.pool, order.pool_type, order).unwrap_or(0);
+
+        if let Some(alt) = order.alt_pool.clone() {
+            let alt_type = match order.pool_type {
+                PoolType::Amm => PoolType::Cl,
+                PoolType::Cl => PoolType::Amm,
+            };
+            if let Some(alt_q) = Self::try_quote(env, &alt, alt_type, order) {
+                if alt_q > primary_q {
+                    return (alt_q, alt, alt_type);
+                }
+            }
+        }
+        (primary_q, order.pool.clone(), order.pool_type)
+    }
+
+    /// Read-only output quote for `order` on `pool` interpreted as `pool_type`.
+    /// Returns `None` if the venue rejects the quote (e.g. wrong token pair).
+    fn try_quote(env: &Env, pool: &Address, pool_type: PoolType, order: &Order) -> Option<i128> {
+        match pool_type {
+            PoolType::Amm => AmmPoolClient::new(env, pool)
+                .try_get_amount_out(&order.token_in, &order.amount_in)
+                .ok()?
+                .ok(),
+            PoolType::Cl => Some(
+                ConcentratedLiquidityClient::new(env, pool)
+                    .try_estimate_price_impact(
+                        &order.zero_for_one,
+                        &order.amount_in,
+                        &order.sqrt_price_limit,
+                    )
+                    .ok()?
+                    .ok()?
+                    .amount_out,
+            ),
+        }
     }
 
     /// Return all pending orders in the current batch window.
@@ -424,12 +628,36 @@ impl BatchAuction {
 mod tests {
     use super::*;
     use amm::AmmPool;
+    use concentrated_liquidity::{ConcentratedLiquidity, ConcentratedLiquidityClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Env, String,
     };
     use token::{LpToken, LpTokenClient};
+
+    /// Deploy a concentrated-liquidity pool over `(token_a, token_b)`, seed a
+    /// wide in-range position, and return the pool address. The pool starts at
+    /// tick 0 with tick spacing 10 and a 30 bps fee.
+    fn deploy_cl_pool(env: &Env, admin: &Address, token_a: &Address, token_b: &Address) -> Address {
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let cl = ConcentratedLiquidityClient::new(env, &cl_addr);
+        cl.initialize(admin, token_a, token_b, &30_i128, &0_i32, &10_i32);
+
+        let lp = Address::generate(env);
+        StellarAssetClient::new(env, token_a).mint(&lp, &100_000_000_i128);
+        StellarAssetClient::new(env, token_b).mint(&lp, &100_000_000_i128);
+        cl.mint_position(
+            &lp,
+            &-1_000_i32,
+            &1_000_i32,
+            &50_000_000_i128,
+            &50_000_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        cl_addr
+    }
 
     fn deploy_pool(env: &Env, token_a: &Address, token_b: &Address) -> Address {
         let amm_addr = env.register_contract(None, AmmPool);
@@ -440,10 +668,9 @@ mod tests {
             &String::from_str(env, "LP"),
             &7u32,
         );
-        AmmPoolClient::new(env, &amm_addr)
-            .initialize(
-                &amm_addr, token_a, token_b, &lp_addr, &30_i128, &amm_addr, &0_i128,
-            );
+        AmmPoolClient::new(env, &amm_addr).initialize(
+            &amm_addr, token_a, token_b, &lp_addr, &30_i128, &amm_addr, &0_i128,
+        );
         amm_addr
     }
 
@@ -479,20 +706,25 @@ mod tests {
         let (ta, tb, pool, admin) = setup(&env);
 
         let auction_addr = env.register_contract(None, BatchAuction);
-        BatchAuctionClient::new(&env, &auction_addr)
-            .initialize(&admin, &30_u64);
+        BatchAuctionClient::new(&env, &auction_addr).initialize(&admin, &30_u64);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
 
-        BatchAuctionClient::new(&env, &auction_addr)
-            .submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        BatchAuctionClient::new(&env, &auction_addr).submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
 
         // Advance past the batch window.
         env.ledger().set_timestamp(1031);
 
-        let results = BatchAuctionClient::new(&env, &auction_addr)
-            .settle_batch();
+        let results = BatchAuctionClient::new(&env, &auction_addr).settle_batch();
 
         assert_eq!(results.len(), 1);
         assert!(results.get(0).unwrap() > 0);
@@ -553,21 +785,26 @@ mod tests {
         let (ta, tb, pool, admin) = setup(&env);
 
         let auction_addr = env.register_contract(None, BatchAuction);
-        BatchAuctionClient::new(&env, &auction_addr)
-            .initialize(&admin, &30_u64);
+        BatchAuctionClient::new(&env, &auction_addr).initialize(&admin, &30_u64);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
 
-        let order_id = BatchAuctionClient::new(&env, &auction_addr)
-            .submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let order_id = BatchAuctionClient::new(&env, &auction_addr).submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
 
         // Tokens were escrowed — trader's balance decreased.
         let balance_after_submit = StellarTokenClient::new(&env, &ta).balance(&trader);
         assert_eq!(balance_after_submit, 90_000_i128);
 
-        BatchAuctionClient::new(&env, &auction_addr)
-            .cancel_order(&trader, &order_id);
+        BatchAuctionClient::new(&env, &auction_addr).cancel_order(&trader, &order_id);
 
         // Tokens returned after cancel.
         let balance_after_cancel = StellarTokenClient::new(&env, &ta).balance(&trader);
@@ -586,13 +823,19 @@ mod tests {
         let (ta, tb, pool, admin) = setup(&env);
 
         let auction_addr = env.register_contract(None, BatchAuction);
-        BatchAuctionClient::new(&env, &auction_addr)
-            .initialize(&admin, &30_u64);
+        BatchAuctionClient::new(&env, &auction_addr).initialize(&admin, &30_u64);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        BatchAuctionClient::new(&env, &auction_addr)
-            .submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        BatchAuctionClient::new(&env, &auction_addr).submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
 
         // Window has not elapsed — should return BatchWindowOpen error.
         let result = BatchAuctionClient::new(&env, &auction_addr).try_settle_batch();
@@ -608,23 +851,35 @@ mod tests {
         let (ta, tb, pool, admin) = setup(&env);
 
         let auction_addr = env.register_contract(None, BatchAuction);
-        BatchAuctionClient::new(&env, &auction_addr)
-            .initialize(&admin, &60_u64);
+        BatchAuctionClient::new(&env, &auction_addr).initialize(&admin, &60_u64);
 
         let trader1 = Address::generate(&env);
         let trader2 = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader1, &50_000_i128);
         StellarAssetClient::new(&env, &ta).mint(&trader2, &50_000_i128);
 
-        BatchAuctionClient::new(&env, &auction_addr)
-            .submit_order(&trader1, &pool, &ta, &tb, &5_000_i128, &0_i128, &u64::MAX);
-        BatchAuctionClient::new(&env, &auction_addr)
-            .submit_order(&trader2, &pool, &ta, &tb, &5_000_i128, &0_i128, &u64::MAX);
+        BatchAuctionClient::new(&env, &auction_addr).submit_order(
+            &trader1,
+            &pool,
+            &ta,
+            &tb,
+            &5_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+        BatchAuctionClient::new(&env, &auction_addr).submit_order(
+            &trader2,
+            &pool,
+            &ta,
+            &tb,
+            &5_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
 
         env.ledger().set_timestamp(1061);
 
-        let results = BatchAuctionClient::new(&env, &auction_addr)
-            .settle_batch();
+        let results = BatchAuctionClient::new(&env, &auction_addr).settle_batch();
 
         assert_eq!(results.len(), 2);
         assert!(results.get(0).unwrap() > 0);
@@ -651,10 +906,8 @@ mod tests {
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
 
-        client
-            .submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
-        client
-            .submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
 
         let result =
             client.try_submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
@@ -687,8 +940,7 @@ mod tests {
         StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
 
         for _ in 0..3 {
-            client
-                .submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+            client.submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
         }
 
         env.ledger().set_timestamp(1031);
@@ -706,5 +958,160 @@ mod tests {
         assert_eq!(window_secs, 30);
         assert_eq!(client.get_pending_orders().len(), 0);
         assert!(StellarTokenClient::new(&env, &tb).balance(&trader) > 0);
+    }
+
+    // ── Issue #351: concentrated-liquidity settlement venue ────────────────────
+
+    #[test]
+    fn test_submit_and_settle_cl_order() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let admin = Address::generate(&env);
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_pool = deploy_cl_pool(&env, &admin, &ta, &tb);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+
+        // token A → token B is the zero_for_one direction; limit 0 lets the pool
+        // walk down to its own bound.
+        client.submit_order_cl(
+            &trader,
+            &cl_pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &true,
+            &0_u128,
+            &None,
+            &u64::MAX,
+        );
+
+        env.ledger().set_timestamp(1031);
+
+        let results = client.settle_batch();
+        assert_eq!(results.len(), 1);
+        assert!(results.get(0).unwrap() > 0);
+
+        // Trader received token_b from the CL pool.
+        assert!(StellarTokenClient::new(&env, &tb).balance(&trader) > 0);
+        // Escrowed token_a was fully consumed by the swap.
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader),
+            90_000_i128
+        );
+    }
+
+    #[test]
+    fn test_quote_and_settle_route_to_best_venue() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let admin = Address::generate(&env);
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        // Two venues over the same pair: a constant-product AMM and a CL pool.
+        let amm_pool = deploy_pool(&env, &ta, &tb);
+        let lp = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp, &2_000_000_i128);
+        StellarAssetClient::new(&env, &tb).mint(&lp, &2_000_000_i128);
+        AmmPoolClient::new(&env, &amm_pool).add_liquidity(
+            &lp,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+        let cl_pool = deploy_cl_pool(&env, &admin, &ta, &tb);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+
+        // CL order with the AMM pool as alternate venue.
+        let order_id = client.submit_order_cl(
+            &trader,
+            &cl_pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &true,
+            &0_u128,
+            &Some(amm_pool.clone()),
+            &u64::MAX,
+        );
+
+        // Independently quote both venues; the best of the two must match the
+        // contract's chosen quote.
+        let amm_q = AmmPoolClient::new(&env, &amm_pool).get_amount_out(&ta, &10_000_i128);
+        let cl_q = ConcentratedLiquidityClient::new(&env, &cl_pool)
+            .estimate_price_impact(&true, &10_000_i128, &0_u128)
+            .amount_out;
+        let expected_best = amm_q.max(cl_q);
+        let expected_pool = if amm_q > cl_q {
+            amm_pool.clone()
+        } else {
+            cl_pool.clone()
+        };
+
+        let (best_out, best_pool, _ptype) = client.quote_order(&order_id);
+        assert_eq!(best_out, expected_best);
+        assert_eq!(best_pool, expected_pool);
+
+        env.ledger().set_timestamp(1031);
+        let results = client.settle_batch();
+        assert_eq!(results.len(), 1);
+        // Realized output is at least the best quote's min_out and positive.
+        assert!(results.get(0).unwrap() > 0);
+        assert!(StellarTokenClient::new(&env, &tb).balance(&trader) > 0);
+    }
+
+    #[test]
+    fn test_amm_order_still_defaults_to_amm_pool_type() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+        let id = client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+
+        let order = client.get_pending_orders().get(0).unwrap();
+        assert_eq!(order.pool_type, PoolType::Amm);
+        assert!(order.alt_pool.is_none());
+
+        // The quote resolves through the AMM venue.
+        let (best_out, best_pool, ptype) = client.quote_order(&id);
+        assert_eq!(best_pool, pool);
+        assert_eq!(ptype, PoolType::Amm);
+        assert!(best_out > 0);
     }
 }
