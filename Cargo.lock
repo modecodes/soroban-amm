@@ -117,6 +117,7 @@ name = "batch_auction"
 version = "0.1.0"
 dependencies = [
  "amm",
+ "concentrated_liquidity",
  "soroban-sdk",
  "token",
 ]
