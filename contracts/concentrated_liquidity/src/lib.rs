@@ -55,6 +55,8 @@ pub enum ClError {
     InvalidToken        = 16, // token_in is not token_a or token_b
     RangeOrderInRange   = 17, // range order must be fully out-of-range at creation
     OracleDeviationExceeded = 18,
+    NftNotConfigured    = 19, // no position-NFT contract is wired into the pool
+    NotNftOwner         = 20, // caller does not currently own the position NFT
 }
 
 /// Status of a range order (issue #295).
@@ -112,6 +114,15 @@ pub enum DataKey {
     ProtocolFeeRecipient,
     AccruedProtocolFeeA,
     AccruedProtocolFeeB,
+    /// Wired-in cl_position_nft contract (issue #348). `Option<Address>`.
+    PositionNft,
+    /// Reverse index: NFT `token_id` → `(original_provider, lower_tick,
+    /// upper_tick)`. Stored at mint time, removed when the NFT is burned.
+    NftTokenToPosition(u64),
+    /// Forward index: `(provider, lower_tick, upper_tick)` → NFT `token_id`.
+    /// Lets the legacy address-keyed entry points detect a tokenized position
+    /// and defer control to the current NFT owner.
+    PositionNftToken(Address, i32, i32),
 }
 
 #[contracttype]
@@ -124,6 +135,16 @@ pub struct AggregatedPrice {
 #[contractclient(name = "OracleAggregatorClient")]
 pub trait OracleAggregatorInterface {
     fn get_price_safe(env: Env, token_a: Address, token_b: Address) -> AggregatedPrice;
+}
+
+/// Minimal view of the `cl_position_nft` contract used by the pool to mint a
+/// receipt when a position opens, burn it when the position closes, and resolve
+/// the current owner of a position NFT (issue #348).
+#[contractclient(name = "PositionNftClient")]
+pub trait PositionNftInterface {
+    fn mint(env: Env, to: Address, pool: Address, lower_tick: i32, upper_tick: i32) -> u64;
+    fn burn(env: Env, token_id: u64);
+    fn owner_of(env: Env, token_id: u64) -> Address;
 }
 
 #[contracttype]
@@ -264,6 +285,60 @@ impl ConcentratedLiquidity {
             .instance()
             .set(&DataKey::OracleAggregator, &oracle);
         Ok(())
+    }
+
+    /// Admin: wire (or detach) the `cl_position_nft` contract used to tokenize
+    /// positions (issue #348).
+    ///
+    /// Once set, opening a fresh position mints a receipt NFT to the provider
+    /// and records a `token_id ↔ position` index. The NFT may then be
+    /// transferred; its current owner — not the original provider — controls
+    /// the position through [`burn_position_by_token_id`](Self::burn_position_by_token_id)
+    /// and [`collect_fees_by_token_id`](Self::collect_fees_by_token_id).
+    ///
+    /// The NFT contract must be initialized with this pool's address as its
+    /// `cl_pool`, otherwise mint/burn calls from the pool will be rejected.
+    pub fn set_position_nft(
+        env: Env,
+        admin: Address,
+        nft: Option<Address>,
+    ) -> Result<(), ClError> {
+        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored {
+            return Err(ClError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::PositionNft, &nft);
+        Ok(())
+    }
+
+    /// Returns the wired-in position-NFT contract, if any.
+    pub fn position_nft(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PositionNft)
+            .unwrap_or(None)
+    }
+
+    /// Returns the NFT `token_id` minted for `(provider, lower_tick,
+    /// upper_tick)`, or `None` if the position is not tokenized.
+    pub fn position_token_id(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PositionNftToken(provider, lower_tick, upper_tick))
+    }
+
+    /// Resolves an NFT `token_id` back to its `(provider, lower_tick,
+    /// upper_tick)` position, or `None` if unknown.
+    pub fn position_of_token(env: Env, token_id: u64) -> Option<(Address, i32, i32)> {
+        env.storage()
+            .instance()
+            .get(&DataKey::NftTokenToPosition(token_id))
     }
 
     /// Admin: max spot-vs-oracle deviation in basis points.
@@ -503,6 +578,10 @@ impl ConcentratedLiquidity {
             fee_growth_inside_b: fg_inside_b,
             tokens_owed: (0, 0),
         });
+        // A position is "fresh" when it currently holds no liquidity — either
+        // brand new or fully burned earlier. Freshly opened positions get a
+        // receipt NFT minted below (issue #348).
+        let was_empty = pos.liquidity == 0;
         let (oa, ob) = Self::pending_fees(&pos, fg_inside_a, fg_inside_b);
         pos.tokens_owed = (pos.tokens_owed.0 + oa, pos.tokens_owed.1 + ob);
         pos.fee_growth_inside_a = fg_inside_a;
@@ -546,6 +625,9 @@ impl ConcentratedLiquidity {
             env.storage()
                 .instance()
                 .set(&DataKey::ActiveLiquidity, &(active + liquidity));
+        }
+        if was_empty {
+            Self::tokenize_position(&env, &provider, lower_tick, upper_tick);
         }
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -878,6 +960,7 @@ impl ConcentratedLiquidity {
             fee_growth_inside_b: fg_inside_b,
             tokens_owed: (0, 0),
         });
+        let was_empty = pos.liquidity == 0;
         let (oa, ob) = Self::pending_fees(&pos, fg_inside_a, fg_inside_b);
         pos.tokens_owed = (pos.tokens_owed.0 + oa, pos.tokens_owed.1 + ob);
         pos.fee_growth_inside_a = fg_inside_a;
@@ -930,6 +1013,9 @@ impl ConcentratedLiquidity {
         // provider, so no transfer is needed — it simply stays in their wallet.
         let dust = amount_in - amount_used;
 
+        if was_empty {
+            Self::tokenize_position(&env, &provider, lower_tick, upper_tick);
+        }
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (symbol_short!("mint_1t"), provider),
@@ -1152,6 +1238,12 @@ impl ConcentratedLiquidity {
         Ok(status)
     }
 
+    /// Burn liquidity from a position keyed by the original `provider` address.
+    ///
+    /// Backwards-compatible entry point. When the position has been tokenized
+    /// (issue #348) and `provider` no longer owns the NFT, the call is rejected
+    /// with [`ClError::NotNftOwner`]: the current NFT owner must use
+    /// [`burn_position_by_token_id`](Self::burn_position_by_token_id) instead.
     pub fn burn_position(
         env: Env,
         provider: Address,
@@ -1161,6 +1253,88 @@ impl ConcentratedLiquidity {
     ) -> Result<(i128, i128), ClError> {
         // No pause guard — LPs must always be able to exit.
         provider.require_auth();
+        Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
+        let res =
+            Self::burn_position_core(&env, &provider, &provider, lower_tick, upper_tick, liquidity)?;
+        Self::cleanup_nft_if_closed(&env, &provider, lower_tick, upper_tick);
+        Ok(res)
+    }
+
+    /// Burn liquidity from a position addressed by its NFT `token_id` (issue #348).
+    ///
+    /// Resolves the original `(provider, lower_tick, upper_tick)` from the
+    /// reverse index, verifies `caller` is the **current** NFT owner, and
+    /// withdraws the underlying tokens to `caller`. When the position is fully
+    /// closed the NFT is burned and both indexes are cleared.
+    pub fn burn_position_by_token_id(
+        env: Env,
+        caller: Address,
+        token_id: u64,
+        liquidity: i128,
+    ) -> Result<(i128, i128), ClError> {
+        let (provider, lower_tick, upper_tick) =
+            Self::resolve_token_owner(&env, &caller, token_id)?;
+        caller.require_auth();
+        let res =
+            Self::burn_position_core(&env, &provider, &caller, lower_tick, upper_tick, liquidity)?;
+
+        // On a full close, sweep any still-owed fees to the current owner before
+        // retiring the NFT. Otherwise the position would be de-tokenized with a
+        // non-zero `tokens_owed` left under the original provider's key, letting
+        // that provider reclaim the new owner's fees via the legacy path.
+        let closed = env
+            .storage()
+            .instance()
+            .get::<_, Position>(&DataKey::Position(provider.clone(), lower_tick, upper_tick))
+            .map(|p| p.liquidity == 0)
+            .unwrap_or(true);
+        if closed {
+            Self::collect_fees_core(&env, &provider, &caller, lower_tick, upper_tick)?;
+            Self::cleanup_nft_if_closed(&env, &provider, lower_tick, upper_tick);
+        }
+        Ok(res)
+    }
+
+    /// Collect accrued fees from a position keyed by the original `provider`.
+    ///
+    /// Like [`burn_position`](Self::burn_position), this defers to the current
+    /// NFT owner once a position is tokenized.
+    pub fn collect_fees(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Result<(i128, i128), ClError> {
+        // No pause guard — LPs must always be able to collect fees.
+        provider.require_auth();
+        Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
+        Self::collect_fees_core(&env, &provider, &provider, lower_tick, upper_tick)
+    }
+
+    /// Collect accrued fees from a position addressed by its NFT `token_id`
+    /// (issue #348). Fees are paid to the current NFT owner (`caller`).
+    pub fn collect_fees_by_token_id(
+        env: Env,
+        caller: Address,
+        token_id: u64,
+    ) -> Result<(i128, i128), ClError> {
+        let (provider, lower_tick, upper_tick) =
+            Self::resolve_token_owner(&env, &caller, token_id)?;
+        caller.require_auth();
+        Self::collect_fees_core(&env, &provider, &caller, lower_tick, upper_tick)
+    }
+
+    /// Shared burn logic. `provider` keys the stored position; `recipient`
+    /// receives the withdrawn tokens. Performs **no** authorization — callers
+    /// are responsible for authenticating the actor.
+    fn burn_position_core(
+        env: &Env,
+        provider: &Address,
+        recipient: &Address,
+        lower_tick: i32,
+        upper_tick: i32,
+        liquidity: i128,
+    ) -> Result<(i128, i128), ClError> {
         if liquidity <= 0 {
             return Err(ClError::ZeroLiquidity);
         }
@@ -1195,9 +1369,9 @@ impl ConcentratedLiquidity {
                 .storage()
                 .persistent()
                 .get(&list_key)
-                .unwrap_or_else(|| Vec::new(&env));
+                .unwrap_or_else(|| Vec::new(env));
             let range = (lower_tick, upper_tick);
-            let mut new_list: Vec<(i32, i32)> = Vec::new(&env);
+            let mut new_list: Vec<(i32, i32)> = Vec::new(env);
             for r in list.iter() {
                 if r != range {
                     new_list.push_back(r);
@@ -1218,7 +1392,7 @@ impl ConcentratedLiquidity {
             .get(&DataKey::FeeGrowthGlobalB)
             .unwrap_or(0);
         Self::update_tick(
-            &env,
+            env,
             lower_tick,
             current_tick,
             -liquidity,
@@ -1226,7 +1400,7 @@ impl ConcentratedLiquidity {
             fg_a,
             fg_b,
         );
-        Self::update_tick(&env, upper_tick, current_tick, -liquidity, true, fg_a, fg_b);
+        Self::update_tick(env, upper_tick, current_tick, -liquidity, true, fg_a, fg_b);
 
         if current_tick >= lower_tick && current_tick < upper_tick {
             let active: i128 = env
@@ -1244,35 +1418,36 @@ impl ConcentratedLiquidity {
             );
         }
         if amount_a > 0 {
-            TokenClient::new(&env, &token_a).transfer(
+            TokenClient::new(env, &token_a).transfer(
                 &env.current_contract_address(),
-                &provider,
+                recipient,
                 &amount_a,
             );
         }
         if amount_b > 0 {
-            TokenClient::new(&env, &token_b).transfer(
+            TokenClient::new(env, &token_b).transfer(
                 &env.current_contract_address(),
-                &provider,
+                recipient,
                 &amount_b,
             );
         }
         soroban_amm_sdk::emit_versioned_event!(
             env,
-            (symbol_short!("burn_pos"), provider),
+            (symbol_short!("burn_pos"), recipient.clone()),
             (lower_tick, upper_tick, liquidity, amount_a, amount_b)
         );
         Ok((amount_a, amount_b))
     }
 
-    pub fn collect_fees(
-        env: Env,
-        provider: Address,
+    /// Shared fee-collection logic. `provider` keys the stored position;
+    /// `recipient` receives the fees. Performs **no** authorization.
+    fn collect_fees_core(
+        env: &Env,
+        provider: &Address,
+        recipient: &Address,
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<(i128, i128), ClError> {
-        // No pause guard — LPs must always be able to collect fees.
-        provider.require_auth();
         let pos_key = DataKey::Position(provider.clone(), lower_tick, upper_tick);
         let mut pos: Position = env
             .storage()
@@ -1293,25 +1468,133 @@ impl ConcentratedLiquidity {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         if total_a > 0 {
-            TokenClient::new(&env, &token_a).transfer(
+            TokenClient::new(env, &token_a).transfer(
                 &env.current_contract_address(),
-                &provider,
+                recipient,
                 &total_a,
             );
         }
         if total_b > 0 {
-            TokenClient::new(&env, &token_b).transfer(
+            TokenClient::new(env, &token_b).transfer(
                 &env.current_contract_address(),
-                &provider,
+                recipient,
                 &total_b,
             );
         }
         soroban_amm_sdk::emit_versioned_event!(
             env,
-            (symbol_short!("coll_fees"), provider),
+            (symbol_short!("coll_fees"), recipient.clone()),
             (lower_tick, upper_tick, total_a, total_b)
         );
         Ok((total_a, total_b))
+    }
+
+    // ── Issue #348: NFT-keyed position ownership helpers ───────────────────────
+
+    /// The wired-in position-NFT contract, if any.
+    fn nft_addr(env: &Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PositionNft)
+            .unwrap_or(None)
+    }
+
+    /// Mint a receipt NFT for a freshly opened position and record both index
+    /// directions. No-op when no NFT contract is configured.
+    fn tokenize_position(env: &Env, provider: &Address, lower_tick: i32, upper_tick: i32) {
+        let Some(nft) = Self::nft_addr(env) else {
+            return;
+        };
+        let token_id = PositionNftClient::new(env, &nft).mint(
+            provider,
+            &env.current_contract_address(),
+            &lower_tick,
+            &upper_tick,
+        );
+        env.storage().instance().set(
+            &DataKey::NftTokenToPosition(token_id),
+            &(provider.clone(), lower_tick, upper_tick),
+        );
+        env.storage().instance().set(
+            &DataKey::PositionNftToken(provider.clone(), lower_tick, upper_tick),
+            &token_id,
+        );
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (symbol_short!("nft_link"), provider.clone()),
+            (token_id, lower_tick, upper_tick)
+        );
+    }
+
+    /// Resolve `(provider, lower_tick, upper_tick)` for `token_id` and verify
+    /// that `caller` is the NFT's current owner.
+    fn resolve_token_owner(
+        env: &Env,
+        caller: &Address,
+        token_id: u64,
+    ) -> Result<(Address, i32, i32), ClError> {
+        let nft = Self::nft_addr(env).ok_or(ClError::NftNotConfigured)?;
+        let position: (Address, i32, i32) = env
+            .storage()
+            .instance()
+            .get(&DataKey::NftTokenToPosition(token_id))
+            .ok_or(ClError::PositionNotFound)?;
+        let owner = PositionNftClient::new(env, &nft).owner_of(&token_id);
+        if owner != *caller {
+            return Err(ClError::NotNftOwner);
+        }
+        Ok(position)
+    }
+
+    /// Guard the legacy address-keyed path: a tokenized position may only be
+    /// operated on by `provider` while `provider` still owns its NFT. Pools
+    /// without an NFT, or untokenized positions, pass through unchanged.
+    fn ensure_legacy_owner(
+        env: &Env,
+        provider: &Address,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Result<(), ClError> {
+        let token_id: Option<u64> = env.storage().instance().get(&DataKey::PositionNftToken(
+            provider.clone(),
+            lower_tick,
+            upper_tick,
+        ));
+        let Some(token_id) = token_id else {
+            return Ok(());
+        };
+        let Some(nft) = Self::nft_addr(env) else {
+            return Ok(());
+        };
+        let owner = PositionNftClient::new(env, &nft).owner_of(&token_id);
+        if owner != *provider {
+            return Err(ClError::NotNftOwner);
+        }
+        Ok(())
+    }
+
+    /// After a burn, if the position is fully closed and tokenized, burn the
+    /// NFT and clear both indexes.
+    fn cleanup_nft_if_closed(env: &Env, provider: &Address, lower_tick: i32, upper_tick: i32) {
+        let pos: Option<Position> = env.storage().instance().get(&DataKey::Position(
+            provider.clone(),
+            lower_tick,
+            upper_tick,
+        ));
+        if pos.map(|p| p.liquidity > 0).unwrap_or(false) {
+            return;
+        }
+        let fwd_key = DataKey::PositionNftToken(provider.clone(), lower_tick, upper_tick);
+        let Some(token_id) = env.storage().instance().get::<_, u64>(&fwd_key) else {
+            return;
+        };
+        if let Some(nft) = Self::nft_addr(env) {
+            PositionNftClient::new(env, &nft).burn(&token_id);
+        }
+        env.storage().instance().remove(&fwd_key);
+        env.storage()
+            .instance()
+            .remove(&DataKey::NftTokenToPosition(token_id));
     }
 
     pub fn get_position(
@@ -5302,5 +5585,328 @@ mod test_single_token_deposit {
 
         // Position was in-range, so both tokens should be returned
         assert!(burn_a > 0 || burn_b > 0, "burn should return tokens");
+    }
+
+    // ── Issue #348: NFT-keyed position ownership ───────────────────────────────
+
+    use cl_position_nft::{ClPositionNft, ClPositionNftClient};
+
+    /// Bundle of handles for a CL pool with a position-NFT contract wired in and
+    /// a single in-range position already opened by `alice`.
+    struct NftFixture<'a> {
+        client: ConcentratedLiquidityClient<'a>,
+        nft: ClPositionNftClient<'a>,
+        token_a: Address,
+        token_b: Address,
+        alice: Address,
+        lower: i32,
+        upper: i32,
+        liquidity: i128,
+    }
+
+    fn setup_with_nft(env: &Env) -> NftFixture<'_> {
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(env);
+        let alice = Address::generate(env);
+
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        // Deploy and wire the position-NFT contract (cl_pool = this pool).
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+        client.set_position_nft(&admin, &Some(nft_addr.clone()));
+
+        StellarAssetClient::new(env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(env, &token_b).mint(&alice, &1_000_000_i128);
+
+        let lower = -100_i32;
+        let upper = 100_i32;
+        client.mint_position(
+            &alice,
+            &lower,
+            &upper,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        let liquidity = client.get_position(&alice, &lower, &upper).liquidity;
+
+        NftFixture {
+            client,
+            nft,
+            token_a,
+            token_b,
+            alice,
+            lower,
+            upper,
+            liquidity,
+        }
+    }
+
+    #[test]
+    fn mint_tokenizes_position_and_records_indexes() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+
+        // NFT token 0 minted to alice, both index directions recorded.
+        assert_eq!(f.nft.owner_of(&0_u64), f.alice);
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            Some(0_u64)
+        );
+        assert_eq!(
+            f.client.position_of_token(&0_u64),
+            Some((f.alice.clone(), f.lower, f.upper))
+        );
+    }
+
+    #[test]
+    fn transferred_owner_can_burn_via_token_id() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        let bob = Address::generate(&env);
+
+        // Alice transfers the position NFT to Bob.
+        f.nft.transfer(&f.alice, &f.alice, &bob, &0_u64);
+        assert_eq!(f.nft.owner_of(&0_u64), bob);
+
+        // Bob fully burns the position via the NFT token id; tokens go to Bob.
+        let (a_out, b_out) = f
+            .client
+            .burn_position_by_token_id(&bob, &0_u64, &f.liquidity);
+        assert!(a_out > 0 || b_out > 0);
+        assert_eq!(TokenClient::new(&env, &f.token_a).balance(&bob), a_out);
+        assert_eq!(TokenClient::new(&env, &f.token_b).balance(&bob), b_out);
+
+        // Position fully closed: NFT burned and both indexes cleared.
+        assert!(f.nft.try_owner_of(&0_u64).is_err());
+        assert_eq!(f.client.position_of_token(&0_u64), None);
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_provider_path_blocked_after_transfer() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        let bob = Address::generate(&env);
+        f.nft.transfer(&f.alice, &f.alice, &bob, &0_u64);
+
+        // Alice no longer owns the NFT — her address-keyed calls are rejected.
+        let burn_err = f
+            .client
+            .try_burn_position(&f.alice, &f.lower, &f.upper, &f.liquidity)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(burn_err, ClError::NotNftOwner);
+
+        let collect_err = f
+            .client
+            .try_collect_fees(&f.alice, &f.lower, &f.upper)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(collect_err, ClError::NotNftOwner);
+    }
+
+    #[test]
+    fn burn_by_token_id_rejects_non_owner() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        let stranger = Address::generate(&env);
+
+        // Stranger never owned the NFT.
+        let err = f
+            .client
+            .try_burn_position_by_token_id(&stranger, &0_u64, &f.liquidity)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, ClError::NotNftOwner);
+
+        // After transfer, even the original provider is no longer the owner.
+        let bob = Address::generate(&env);
+        f.nft.transfer(&f.alice, &f.alice, &bob, &0_u64);
+        let err2 = f
+            .client
+            .try_burn_position_by_token_id(&f.alice, &0_u64, &f.liquidity)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err2, ClError::NotNftOwner);
+    }
+
+    #[test]
+    fn transferred_owner_collects_fees_via_token_id() {
+        // Dedicated high-fee pool (1000 bps) so swap fees are clearly observable,
+        // mirroring the existing fee-accrual tests.
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &1000_i128, &100_i32, &1_i32);
+
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+        client.set_position_nft(&admin, &Some(nft_addr));
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+        client.mint_position(
+            &alice,
+            &0_i32,
+            &150_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+
+        // Alice transfers the position NFT to Bob.
+        let bob = Address::generate(&env);
+        nft.transfer(&alice, &alice, &bob, &0_u64);
+
+        // A trader swaps token A → token B, accruing token A fees to the position.
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader, &50_000_i128);
+        client.swap(&trader, &true, &2_000_i128, &0_u128, &0_i128, &u64::MAX);
+
+        // Bob (current owner) collects the accrued fees to his own address.
+        let (fee_a, fee_b) = client.collect_fees_by_token_id(&bob, &0_u64);
+        assert!(fee_a > 0, "token A fees should accrue from an A->B swap");
+        assert_eq!(TokenClient::new(&env, &token_a).balance(&bob), fee_a);
+        assert_eq!(fee_b, 0);
+
+        // The NFT and its indexes survive a fee collection (position still open).
+        assert_eq!(nft.owner_of(&0_u64), bob);
+        assert_eq!(
+            client.position_of_token(&0_u64),
+            Some((alice.clone(), 0_i32, 150_i32))
+        );
+    }
+
+    #[test]
+    fn full_burn_via_token_id_does_not_leak_fees_to_provider() {
+        // High-fee pool so fees clearly accrue.
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &1000_i128, &100_i32, &1_i32);
+
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+        client.set_position_nft(&admin, &Some(nft_addr));
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+        client.mint_position(
+            &alice,
+            &0_i32,
+            &150_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        let liquidity = client.get_position(&alice, &0_i32, &150_i32).liquidity;
+
+        // Transfer to Bob, then accrue fees via a swap.
+        let bob = Address::generate(&env);
+        nft.transfer(&alice, &alice, &bob, &0_u64);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader, &50_000_i128);
+        client.swap(&trader, &true, &2_000_i128, &0_u128, &0_i128, &u64::MAX);
+
+        // Bob fully closes the position WITHOUT a separate collect_fees call.
+        client.burn_position_by_token_id(&bob, &0_u64, &liquidity);
+        assert!(TokenClient::new(&env, &token_a).balance(&bob) > 0);
+
+        // The original provider can no longer reclaim the accrued fees: the
+        // owed balance was swept to Bob on close.
+        let (alice_a, alice_b) = client.collect_fees(&alice, &0_i32, &150_i32);
+        assert_eq!((alice_a, alice_b), (0_i128, 0_i128));
+    }
+
+    #[test]
+    fn token_id_path_requires_nft_configured() {
+        // A pool with no NFT wired in cannot resolve positions by token id.
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let err = client
+            .try_burn_position_by_token_id(&admin, &0_u64, &1_i128)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, ClError::NftNotConfigured);
+    }
+
+    #[test]
+    fn legacy_path_unaffected_when_owner_unchanged() {
+        // While the original provider still holds the NFT, the address-keyed
+        // path keeps working exactly as before.
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+
+        let (a_out, b_out) = f
+            .client
+            .burn_position(&f.alice, &f.lower, &f.upper, &f.liquidity);
+        assert!(a_out > 0 || b_out > 0);
+
+        // Full close burns the NFT and clears the indexes.
+        assert!(f.nft.try_owner_of(&0_u64).is_err());
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            None
+        );
     }
 }
