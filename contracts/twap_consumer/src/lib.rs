@@ -14,6 +14,8 @@ pub trait ClPoolOracle {
 
 #[contracttype]
 pub enum DataKey {
+    /// Address authorized to write and delete snapshots (a keeper bot or governance).
+    Keeper,
     Snapshot(Address, u64),
     TrackedPools,
 }
@@ -46,11 +48,38 @@ impl TwapConsumer {
     pub const BPS_DENOMINATOR: i128 = 10_000;
     pub const PRICE_SCALE: i128 = 1_000_000;
 
+    /// Registers the keeper authorized to write and delete snapshots.
+    ///
+    /// Must be called once at deploy time. Snapshot mutations (`save_snapshot`,
+    /// `save_cl_snapshot`, `delete_snapshot`) require the keeper's authorization,
+    /// preventing arbitrary callers from poisoning or purging price history.
+    pub fn initialize(env: Env, keeper: Address) {
+        assert!(
+            !env.storage().instance().has(&DataKey::Keeper),
+            "already initialized"
+        );
+        env.storage().instance().set(&DataKey::Keeper, &keeper);
+    }
+
+    /// Returns the configured keeper, panicking if the contract is not initialized.
+    pub fn get_keeper(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Keeper)
+            .unwrap_or_else(|| panic!("contract not initialized"))
+    }
+
+    /// Requires the stored keeper's authorization for snapshot mutations.
+    fn require_keeper(env: &Env) {
+        Self::get_keeper(env.clone()).require_auth();
+    }
+
     /// Stores a pool cumulative-price snapshot keyed by the pool timestamp.
     ///
     /// Also registers the pool in the TrackedPools list if it has not been seen before,
     /// enabling `get_tracked_pools` and `get_twap_all` to enumerate all observed pools.
     pub fn save_snapshot(env: Env, pool: Address) {
+        Self::require_keeper(&env);
         let (cum_a, cum_b, pool_ts) = AmmPoolOracleClient::new(&env, &pool).get_price_cumulative();
         let ledger_ts = env.ledger().timestamp(); // key by keeper clock, not pool clock
         let snapshot = PriceSnapshot {
@@ -89,6 +118,7 @@ impl TwapConsumer {
 
     /// Deletes a price snapshot from persistent storage.
     pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) {
+        Self::require_keeper(&env);
         let key = DataKey::Snapshot(pool, ledger_ts);
         env.storage().persistent().remove(&key);
     }
@@ -294,6 +324,7 @@ impl TwapConsumer {
 
     /// Save a snapshot from a CL pool (stores tick_cumulative in the cum_a field).
     pub fn save_cl_snapshot(env: Env, pool: Address) {
+        Self::require_keeper(&env);
         let (tick_cum, pool_ts) = ClPoolOracleClient::new(&env, &pool).get_tick_cumulative();
         let ledger_ts = env.ledger().timestamp();
         let snapshot = PriceSnapshot {
@@ -379,19 +410,14 @@ mod tests {
         );
 
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
         consumer.save_snapshot(&amm_addr);
 
         // Let 60s pass at the pre-trade price, then execute a large trade that moves spot.
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_000_i128);
-        amm.swap(
-            &whale,
-            &ta.address,
-            &1_000_000_i128,
-            &0_i128,
-            &10_060_u64,
-        );
+        amm.swap(&whale, &ta.address, &1_000_000_i128, &0_i128, &10_060_u64);
 
         let twap = consumer.get_twap_price(&amm_addr, &60_u64);
         let (spot_a, _spot_b) = amm.price_ratio();
@@ -445,18 +471,13 @@ mod tests {
         );
 
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
         consumer.save_snapshot(&amm_addr);
 
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_000_i128);
-        amm.swap(
-            &whale,
-            &ta.address,
-            &1_000_000_i128,
-            &0_i128,
-            &10_060_u64,
-        );
+        amm.swap(&whale, &ta.address, &1_000_000_i128, &0_i128, &10_060_u64);
 
         let (spot_a, _spot_b) = amm.price_ratio();
         let validation =
@@ -512,18 +533,13 @@ mod tests {
         );
 
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
         consumer.save_snapshot(&amm_addr);
 
         env.ledger().set_timestamp(10_060);
         let trader = Address::generate(&env);
         ta_sac.mint(&trader, &1_000_i128);
-        amm.swap(
-            &trader,
-            &ta.address,
-            &1_000_i128,
-            &0_i128,
-            &10_060_u64,
-        );
+        amm.swap(&trader, &ta.address, &1_000_i128, &0_i128, &10_060_u64);
 
         let (safe_spot, _spot_b) = amm.price_ratio();
         let collateral_value = consumer.assert_lending_price_safe(
@@ -590,19 +606,14 @@ mod tests {
         );
 
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
         consumer.save_snapshot(&amm_addr);
 
         // Let 60s pass
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_i128);
-        amm.swap(
-            &whale,
-            &ta.address,
-            &1_000_i128,
-            &0_i128,
-            &10_060_u64,
-        );
+        amm.swap(&whale, &ta.address, &1_000_i128, &0_i128, &10_060_u64);
 
         let (twap_a_to_b, twap_b_to_a) = consumer.get_twap_both(&amm_addr, &60_u64);
 
@@ -655,19 +666,14 @@ mod tests {
         );
 
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
         consumer.save_snapshot(&amm_addr);
 
         // Let 60s pass
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_i128);
-        amm.swap(
-            &whale,
-            &ta.address,
-            &1_000_i128,
-            &0_i128,
-            &10_060_u64,
-        );
+        amm.swap(&whale, &ta.address, &1_000_i128, &0_i128, &10_060_u64);
 
         let (twap_a_to_b, twap_b_to_a) = consumer.get_twap_both(&amm_addr, &60_u64);
 
@@ -740,6 +746,7 @@ mod tests {
 
         let consumer_addr = env.register_contract(None, TwapConsumer);
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
 
         // Save a snapshot for each pool at t=10_000.
         consumer.save_snapshot(&amm_addr1);
@@ -759,22 +766,10 @@ mod tests {
         env.ledger().set_timestamp(10_060);
         let whale1 = Address::generate(&env);
         ta1_sac.mint(&whale1, &1_000_i128);
-        amm1.swap(
-            &whale1,
-            &ta1.address,
-            &1_000_i128,
-            &0_i128,
-            &10_060_u64,
-        );
+        amm1.swap(&whale1, &ta1.address, &1_000_i128, &0_i128, &10_060_u64);
         let whale2 = Address::generate(&env);
         ta2_sac.mint(&whale2, &1_000_i128);
-        amm2.swap(
-            &whale2,
-            &ta2.address,
-            &1_000_i128,
-            &0_i128,
-            &10_060_u64,
-        );
+        amm2.swap(&whale2, &ta2.address, &1_000_i128, &0_i128, &10_060_u64);
 
         // get_twap_all must return TWAPs for both pools.
         let all_twaps = consumer.get_twap_all(&60_u64);
@@ -843,19 +838,14 @@ mod tests {
         );
 
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
         consumer.save_snapshot(&amm_addr);
 
         // Verify snapshot was saved and can be used (get_twap_price does not panic)
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_i128);
-        amm.swap(
-            &whale,
-            &ta.address,
-            &1_000_i128,
-            &0_i128,
-            &10_060_u64,
-        );
+        amm.swap(&whale, &ta.address, &1_000_i128, &0_i128, &10_060_u64);
         let price = consumer.get_twap_price(&amm_addr, &60_u64);
         assert_eq!(price, 1_000_000);
 
@@ -865,5 +855,58 @@ mod tests {
         // Verify that calling get_twap_price now panics (since target snapshot is missing)
         let result = consumer.try_get_twap_price(&amm_addr, &60_u64);
         assert!(result.is_err());
+    }
+
+    // Issue #371: snapshot mutations must be gated behind the keeper's auth.
+    #[test]
+    fn test_save_snapshot_requires_keeper_auth() {
+        let env = Env::default();
+        env.ledger().set_timestamp(10_000);
+
+        let keeper = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+
+        consumer.initialize(&keeper);
+
+        // No auth has been mocked: an unauthorized save must fail.
+        let result = consumer.try_save_snapshot(&pool);
+        assert!(result.is_err());
+
+        // The same is true for delete and CL snapshot writes.
+        assert!(consumer.try_delete_snapshot(&pool, &10_000).is_err());
+        assert!(consumer.try_save_cl_snapshot(&pool).is_err());
+    }
+
+    // Issue #371: snapshot mutations must fail before initialize is called.
+    #[test]
+    fn test_save_snapshot_fails_when_uninitialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let pool = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+
+        // Keeper was never registered, so the contract is uninitialized.
+        assert!(consumer.try_save_snapshot(&pool).is_err());
+    }
+
+    // Issue #371: initialize is a one-time operation.
+    #[test]
+    fn test_initialize_is_idempotent_guard() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let keeper = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+
+        consumer.initialize(&keeper);
+        assert_eq!(consumer.get_keeper(), keeper);
+        // A second initialize must be rejected.
+        assert!(consumer.try_initialize(&Address::generate(&env)).is_err());
     }
 }
