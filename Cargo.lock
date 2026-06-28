@@ -229,6 +229,7 @@ name = "concentrated_liquidity"
 version = "0.1.0"
 dependencies = [
  "amm",
+ "cl_position_nft",
  "soroban-amm-sdk",
  "soroban-sdk",
  "token",
