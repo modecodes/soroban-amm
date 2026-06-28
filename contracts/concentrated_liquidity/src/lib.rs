@@ -23,6 +23,17 @@ const TICK_BASE_DEN: i128 = PRICE_SCALE;
 const MIN_TICK: i32 = -887_272;
 const MAX_TICK: i32 = 887_272;
 
+// Per-user position state lives in persistent storage (see issue #346): it is
+// unbounded in the number of LPs and tick ranges, so it must not share the
+// fixed 64 KB instance-storage budget. Persistent entries are evicted once
+// their TTL lapses, so every write bumps the entry's TTL back up.
+//
+// Only extend when fewer than this many ledgers of life remain
+// (~30 days at 5 s/ledger); avoids redundant bumps on every access.
+const POSITION_TTL_THRESHOLD: u32 = 518_400;
+// Extend a touched entry's life to this many ledgers (~180 days at 5 s/ledger).
+const POSITION_BUMP_TO: u32 = 3_110_400;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ClError {
@@ -364,6 +375,17 @@ impl ConcentratedLiquidity {
             .unwrap_or(false)
     }
 
+    /// Extends the TTL of a per-user persistent entry (a `Position` or a
+    /// `PositionList`) so long-lived positions are not evicted while in use.
+    ///
+    /// Must only be called for an entry that currently exists — i.e. right
+    /// after writing it — because `extend_ttl` traps on a missing key.
+    fn bump_position(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, POSITION_TTL_THRESHOLD, POSITION_BUMP_TO);
+    }
+
     fn check_oracle_deviation(
         env: &Env,
         token_in: &Address,
@@ -473,7 +495,7 @@ impl ConcentratedLiquidity {
         let (fg_inside_a, fg_inside_b) =
             Self::fee_growth_inside(env.clone(), lower_tick, upper_tick);
 
-        let mut pos: Position = env.storage().instance().get(&pos_key).unwrap_or(Position {
+        let mut pos: Position = env.storage().persistent().get(&pos_key).unwrap_or(Position {
             lower_tick,
             upper_tick,
             liquidity: 0,
@@ -490,15 +512,17 @@ impl ConcentratedLiquidity {
         let list_key = DataKey::PositionList(provider.clone());
         let mut list: Vec<(i32, i32)> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
         let range = (lower_tick, upper_tick);
         if !list.iter().any(|r| r == range) {
             list.push_back(range);
-            env.storage().instance().set(&list_key, &list);
+            env.storage().persistent().set(&list_key, &list);
+            Self::bump_position(&env, &list_key);
         }
-        env.storage().instance().set(&pos_key, &pos);
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(&env, &pos_key);
 
         let fg_a: i128 = env
             .storage()
@@ -583,7 +607,7 @@ impl ConcentratedLiquidity {
         let pos_key = DataKey::Position(provider.clone(), lower_tick, upper_tick);
         let mut pos: Position = env
             .storage()
-            .instance()
+            .persistent()
             .get(&pos_key)
             .ok_or(ClError::PositionNotFound)?;
 
@@ -626,15 +650,17 @@ impl ConcentratedLiquidity {
         let list_key = DataKey::PositionList(provider.clone());
         let mut list: Vec<(i32, i32)> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
         let range = (lower_tick, upper_tick);
         if !list.iter().any(|r| r == range) {
             list.push_back(range);
-            env.storage().instance().set(&list_key, &list);
+            env.storage().persistent().set(&list_key, &list);
+            Self::bump_position(&env, &list_key);
         }
-        env.storage().instance().set(&pos_key, &pos);
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(&env, &pos_key);
 
         let fg_a: i128 = env
             .storage()
@@ -844,7 +870,7 @@ impl ConcentratedLiquidity {
         let (fg_inside_a, fg_inside_b) =
             Self::fee_growth_inside(env.clone(), lower_tick, upper_tick);
 
-        let mut pos: Position = env.storage().instance().get(&pos_key).unwrap_or(Position {
+        let mut pos: Position = env.storage().persistent().get(&pos_key).unwrap_or(Position {
             lower_tick,
             upper_tick,
             liquidity: 0,
@@ -862,15 +888,17 @@ impl ConcentratedLiquidity {
         let list_key = DataKey::PositionList(provider.clone());
         let mut list: Vec<(i32, i32)> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
         let range_pair = (lower_tick, upper_tick);
         if !list.iter().any(|r| r == range_pair) {
             list.push_back(range_pair);
-            env.storage().instance().set(&list_key, &list);
+            env.storage().persistent().set(&list_key, &list);
+            Self::bump_position(&env, &list_key);
         }
-        env.storage().instance().set(&pos_key, &pos);
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(&env, &pos_key);
 
         // ── Update tick state ─────────────────────────────────────────────────
         let fg_a: i128 = env
@@ -1085,7 +1113,7 @@ impl ConcentratedLiquidity {
         // Verify the position exists and is tagged as a range order.
         let _pos: Position = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Position(provider.clone(), lower_tick, upper_tick))
             .ok_or(ClError::PositionNotFound)?;
 
@@ -1139,7 +1167,7 @@ impl ConcentratedLiquidity {
         let pos_key = DataKey::Position(provider.clone(), lower_tick, upper_tick);
         let mut pos: Position = env
             .storage()
-            .instance()
+            .persistent()
             .get(&pos_key)
             .ok_or(ClError::PositionNotFound)?;
         if pos.liquidity < liquidity {
@@ -1158,13 +1186,14 @@ impl ConcentratedLiquidity {
         let (amount_a, amount_b) =
             Self::amounts_for_liquidity_to_burn(current_tick, lower_tick, upper_tick, liquidity);
         pos.liquidity -= liquidity;
-        env.storage().instance().set(&pos_key, &pos);
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(&env, &pos_key);
         // Remove from position list when position is fully closed
         if pos.liquidity == 0 {
             let list_key = DataKey::PositionList(provider.clone());
             let list: Vec<(i32, i32)> = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&list_key)
                 .unwrap_or_else(|| Vec::new(&env));
             let range = (lower_tick, upper_tick);
@@ -1174,7 +1203,8 @@ impl ConcentratedLiquidity {
                     new_list.push_back(r);
                 }
             }
-            env.storage().instance().set(&list_key, &new_list);
+            env.storage().persistent().set(&list_key, &new_list);
+            Self::bump_position(&env, &list_key);
         }
 
         let fg_a: i128 = env
@@ -1246,7 +1276,7 @@ impl ConcentratedLiquidity {
         let pos_key = DataKey::Position(provider.clone(), lower_tick, upper_tick);
         let mut pos: Position = env
             .storage()
-            .instance()
+            .persistent()
             .get(&pos_key)
             .ok_or(ClError::PositionNotFound)?;
 
@@ -1258,7 +1288,8 @@ impl ConcentratedLiquidity {
         pos.tokens_owed = (0, 0);
         pos.fee_growth_inside_a = fg_inside_a;
         pos.fee_growth_inside_b = fg_inside_b;
-        env.storage().instance().set(&pos_key, &pos);
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(&env, &pos_key);
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         if total_a > 0 {
@@ -1290,7 +1321,7 @@ impl ConcentratedLiquidity {
         upper_tick: i32,
     ) -> Result<Position, ClError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Position(provider, lower_tick, upper_tick))
             .ok_or(ClError::PositionNotFound)
     }
@@ -1924,7 +1955,7 @@ impl ConcentratedLiquidity {
     /// Returns all open position tick-range pairs for `provider`.
     pub fn get_positions(env: Env, provider: Address) -> Vec<(i32, i32)> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PositionList(provider))
             .unwrap_or_else(|| Vec::new(&env))
     }
@@ -2648,6 +2679,40 @@ mod tests {
         let state3 = te.client.get_pool_state();
         assert!(state3.current_tick < 0);
         assert!(state3.sqrt_price < (1u128 << 96));
+    }
+
+    /// Regression test for issue #346: per-user position state must live in
+    /// persistent storage, not the shared 64 KB instance budget.
+    #[test]
+    fn positions_are_stored_in_persistent_storage() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 30_i128, 0_i32);
+
+        te.client.mint_position(
+            &te.provider,
+            &-100_i32,
+            &100_i32,
+            &10_000_i128,
+            &10_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+
+        let pos_key = DataKey::Position(te.provider.clone(), -100, 100);
+        let list_key = DataKey::PositionList(te.provider.clone());
+
+        env.as_contract(&te.cl_addr, || {
+            // The position and its tracking list are persisted...
+            assert!(env.storage().persistent().has(&pos_key));
+            assert!(env.storage().persistent().has(&list_key));
+            // ...and must not consume the shared instance budget.
+            assert!(!env.storage().instance().has(&pos_key));
+            assert!(!env.storage().instance().has(&list_key));
+        });
+
+        // The view path resolves the same persistent entries.
+        assert!(te.client.get_position(&te.provider, &-100, &100).liquidity > 0);
+        assert_eq!(te.client.get_positions(&te.provider).len(), 1);
     }
 
     #[test]
